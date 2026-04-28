@@ -53,7 +53,7 @@ async def embed_text(text: str) -> list:
     try:
         emb_result = await asyncio.to_thread(
             genai.embed_content,
-            model="models/embedding-001",
+            model="models/gemini-embedding-2",
             content=text,
             task_type="retrieval_document" # Для документов используем этот тип
         )

@@ -18,9 +18,24 @@ def init_firebase():
     """
     global db
     if not firebase_admin._apps:
+        # Пытаемся загрузить из JSON-строки в переменной окружения (удобно для Render)
+        cred_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+        if cred_json:
+            try:
+                import json
+                cred_dict = json.loads(cred_json)
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+                db = firestore.client()
+                logger.info("Успешное подключение к Firebase Firestore (через JSON ENV).")
+                return True
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации Firebase через JSON ENV: {e}")
+                # Если не получилось через ENV, идем дальше к файлу
+
         cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_credentials.json")
         if not os.path.exists(cred_path):
-            logger.warning(f"Файл ключей Firebase '{cred_path}' не найден! База данных не подключена.")
+            logger.warning(f"Файл ключей Firebase '{cred_path}' не найден и FIREBASE_CREDENTIALS_JSON не задан! База данных не подключена.")
             return False
             
         try:

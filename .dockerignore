@@ -1,0 +1,33 @@
+# Виртуальное окружение
+venv/
+.venv/
+
+# Python кэш
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Docker (не нужно копировать рекурсивно)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Окружение (пробрасываем через env_file, не копируем в образ)
+.env
+
+# Тесты / скрипты
+test_*.py
+*.md
+
+# OS
+Thumbs.db
+.DS_Store

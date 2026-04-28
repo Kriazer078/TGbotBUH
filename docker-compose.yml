@@ -1,0 +1,31 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tgbotbuh:latest
+    container_name: tgbotbuh_bot
+    restart: unless-stopped
+
+    # Переменные окружения из .env
+    env_file:
+      - .env
+
+    # Монтируем firebase_credentials.json в защищённую директорию внутри контейнера
+    volumes:
+      - ./firebase_credentials.json:/app/secrets/firebase_credentials.json:ro
+
+    # Логи: ограничиваем размер чтобы диск не переполнялся
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Политика перезапуска при сбоях
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

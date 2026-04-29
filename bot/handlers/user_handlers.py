@@ -319,7 +319,6 @@ async def handle_user_message(message: Message):
     await message.answer(
         answer,
         parse_mode="HTML",
-        message_thread_id=thread_id,
         disable_web_page_preview=True,
         reply_markup=reply_markup,
     )

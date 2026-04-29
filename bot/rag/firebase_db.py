@@ -259,10 +259,10 @@ def get_similar_dialogs(query_embedding: list, top_k: int = 2) -> list[dict]:
         return []
     try:
         # Берём только хорошие ответы (оценены пользователями)
+        from google.cloud.firestore_v1.base_query import FieldFilter
         docs = (
             db.collection("dialogs")
-            .where("rating", "==", "good")
-            .where("embedding", "!=", None)
+            .where(filter=FieldFilter("rating", "==", "good"))
             .limit(200)
             .stream()
         )
@@ -302,9 +302,10 @@ def get_pending_reviews(limit: int = 10) -> list[dict]:
     if not db:
         return []
     try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
         docs = (
             db.collection("dialogs_review")
-            .where("status", "==", "pending")
+            .where(filter=FieldFilter("status", "==", "pending"))
             .order_by("flagged_at", direction=firestore.Query.DESCENDING)
             .limit(limit)
             .stream()

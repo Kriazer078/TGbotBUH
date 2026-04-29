@@ -59,9 +59,7 @@ async def cmd_start(message: Message):
         "<b>Команды:</b>\n"
         "/calc — калькулятор для бухгалтера\n"
         "/rates — актуальные ставки 2026\n"
-        "/news — обновить базу новостей\n"
-        "/learn — обучение бота (только для админа)\n"
-        "/review — просмотр диалогов (только для админа)\n\n"
+        "/news — обновить базу новостей\n\n"
         "Просто напишите ваш вопрос или сумму для расчёта!"
     )
     await message.answer(welcome_text, parse_mode="HTML")
@@ -172,7 +170,7 @@ async def cmd_news(message: Message):
 @user_router.message(Command("learn"))
 async def cmd_learn(message: Message):
     if not _is_allowed_thread(message): return
-    admin_id = os.getenv("ADMIN_ID")
+    admin_id = os.getenv("ADMIN_ID", "6493072610")
     if not admin_id or str(message.from_user.id) != admin_id:
         await message.answer("⛔ У вас нет прав для использования этой команды.")
         return
@@ -212,7 +210,7 @@ async def cmd_learn(message: Message):
 @user_router.message(Command("review"))
 async def cmd_review(message: Message):
     if not _is_allowed_thread(message): return
-    admin_id = os.getenv("ADMIN_ID")
+    admin_id = os.getenv("ADMIN_ID", "6493072610")
     if not admin_id or str(message.from_user.id) != admin_id:
         await message.answer("⛔ У вас нет прав для использования этой команды.")
         return

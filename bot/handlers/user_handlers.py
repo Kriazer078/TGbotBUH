@@ -19,11 +19,15 @@ user_router = Router()
 
 def _is_allowed_thread(message: Message) -> bool:
     """Возвращает True, если сообщение пришло из разрешённой темы."""
-    allowed_thread_id = os.getenv("ALLOWED_THREAD_ID")
-    if not allowed_thread_id:
+    # Поддерживаем как один ID, так и список через запятую
+    allowed_ids_str = os.getenv("ALLOWED_THREAD_ID", "")
+    
+    if not allowed_ids_str:
         # Если переменная не задана — отвечаем везде
         return True
-    return str(message.message_thread_id) == str(allowed_thread_id)
+        
+    allowed_ids = [i.strip() for i in allowed_ids_str.split(",") if i.strip()]
+    return str(message.message_thread_id) in allowed_ids
 
 
 # ── Вспомогательная функция: клавиатура оценки ───────────────────────────────
@@ -289,18 +293,17 @@ async def handle_rating(callback: CallbackQuery):
 # ── Любое текстовое сообщение → AI ───────────────────────────────────────────
 @user_router.message(F.text)
 async def handle_user_message(message: Message):
-    thread_id = message.message_thread_id
-
-    allowed_thread_id = os.getenv("ALLOWED_THREAD_ID")
-    if allowed_thread_id and str(thread_id) != str(allowed_thread_id):
+    if not _is_allowed_thread(message):
         return
 
+    thread_id = message.message_thread_id
     user_query = message.text
     user_id    = message.from_user.id
     logger.info(f"Запрос от {user_id} в теме {thread_id}: {user_query[:80]}")
 
-    if not allowed_thread_id:
-        logger.info(f"Hint: добавьте в .env ALLOWED_THREAD_ID={thread_id}")
+    allowed_ids_str = os.getenv("ALLOWED_THREAD_ID", "")
+    if not allowed_ids_str:
+        logger.info(f"Hint: добавьте в .env ALLOWED_THREAD_ID={thread_id} (или несколько через запятую)")
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 

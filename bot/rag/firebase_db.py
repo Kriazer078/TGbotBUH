@@ -1,5 +1,7 @@
 import logging
 import os
+import uuid
+from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, firestore
 import numpy as np
@@ -131,6 +133,30 @@ async def search_similar_articles(query_embedding, top_k=3):
         
     return top_results
 
+async def add_learned_text(text: str, embedding: list) -> bool:
+    """Сохраняет новую информацию (обученную админом) в knowledge_base."""
+    global _vector_cache
+    if not db:
+        return False
+    try:
+        import uuid
+        doc_id = f"learned_{uuid.uuid4().hex[:8]}"
+        data = {
+            "title": "Обучено администратором",
+            "text": text,
+            "url": "admin_learn",
+            "embedding": embedding
+        }
+        db.collection('knowledge_base').document(doc_id).set(data)
+        
+        # Обновляем кэш
+        _vector_cache.append(data)
+        logger.info(f"Добавлено новое правило от админа: {doc_id}")
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении обученного текста: {e}")
+        return False
+
 
 def get_recent_news(limit: int = 5) -> list[dict]:
     """
@@ -160,4 +186,130 @@ def get_recent_news(limit: int = 5) -> list[dict]:
         return news
     except Exception as e:
         logger.error(f"[firebase_db] Ошибка при получении новостей: {e}")
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ХРАНЕНИЕ ДИАЛОГОВ И ОБРАТНАЯ СВЯЗЬ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_dialog(user_id: int, user_text: str, bot_answer: str,
+                thread_id: int = None, embedding: list = None) -> str | None:
+    """
+    Сохраняет пару вопрос-ответ в коллекцию 'dialogs'.
+    Возвращает doc_id для последующей оценки.
+    """
+    if not db:
+        return None
+    try:
+        doc_id = f"dlg_{uuid.uuid4().hex[:12]}"
+        data = {
+            "user_id":   user_id,
+            "thread_id": thread_id,
+            "question":  user_text,
+            "answer":    bot_answer,
+            "rating":    None,        # None / "good" / "bad"
+            "embedding": embedding,   # вектор вопроса (для похожих запросов)
+            "created_at": datetime.utcnow(),
+        }
+        db.collection("dialogs").document(doc_id).set(data)
+        logger.info(f"[dialog] Сохранён диалог {doc_id} от user {user_id}")
+        return doc_id
+    except Exception as e:
+        logger.error(f"[dialog] Ошибка сохранения диалога: {e}")
+        return None
+
+
+def update_dialog_rating(doc_id: str, rating: str) -> bool:
+    """
+    Обновляет оценку диалога ('good' или 'bad').
+    Если оценка 'bad' — добавляем в knowledge_base как «проблемный вопрос» для дообучения.
+    """
+    if not db:
+        return False
+    try:
+        doc_ref = db.collection("dialogs").document(doc_id)
+        doc_ref.update({"rating": rating, "rated_at": datetime.utcnow()})
+
+        if rating == "bad":
+            # Помечаем как «требует проверки» — админ может исправить через /learn
+            data = doc_ref.get().to_dict()
+            if data:
+                db.collection("dialogs_review").document(doc_id).set({
+                    "question":   data.get("question", ""),
+                    "bad_answer": data.get("answer", ""),
+                    "user_id":    data.get("user_id"),
+                    "created_at": data.get("created_at"),
+                    "flagged_at": datetime.utcnow(),
+                    "status":     "pending",  # pending / fixed
+                })
+                logger.info(f"[dialog] Диалог {doc_id} помечен как 'bad' → отправлен на проверку")
+        return True
+    except Exception as e:
+        logger.error(f"[dialog] Ошибка обновления рейтинга: {e}")
+        return False
+
+
+def get_similar_dialogs(query_embedding: list, top_k: int = 2) -> list[dict]:
+    """
+    Находит похожие прошлые диалоги с хорошей оценкой (rating='good').
+    Используется как контекст для RAG — «обучение на опыте».
+    """
+    if not db or not query_embedding:
+        return []
+    try:
+        # Берём только хорошие ответы (оценены пользователями)
+        docs = (
+            db.collection("dialogs")
+            .where("rating", "==", "good")
+            .where("embedding", "!=", None)
+            .limit(200)
+            .stream()
+        )
+        candidates = []
+        for doc in docs:
+            d = doc.to_dict()
+            if d.get("embedding"):
+                candidates.append(d)
+
+        if not candidates:
+            return []
+
+        q = np.array(query_embedding)
+        scored = []
+        for c in candidates:
+            v = np.array(c["embedding"])
+            sim = float(np.dot(q, v) / (np.linalg.norm(q) * np.linalg.norm(v) + 1e-10))
+            scored.append((sim, c))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        result = []
+        for sim, c in scored[:top_k]:
+            if sim > 0.75:   # только очень похожие вопросы
+                result.append({
+                    "question": c.get("question", ""),
+                    "answer":   c.get("answer", ""),
+                    "score":    sim,
+                })
+        return result
+    except Exception as e:
+        logger.error(f"[dialog] Ошибка поиска похожих диалогов: {e}")
+        return []
+
+
+def get_pending_reviews(limit: int = 10) -> list[dict]:
+    """Возвращает список диалогов, помеченных как 'плохие' (для /review админа)."""
+    if not db:
+        return []
+    try:
+        docs = (
+            db.collection("dialogs_review")
+            .where("status", "==", "pending")
+            .order_by("flagged_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+            .stream()
+        )
+        return [d.to_dict() | {"id": d.id} for d in docs]
+    except Exception as e:
+        logger.error(f"[dialog] Ошибка получения проблемных диалогов: {e}")
         return []

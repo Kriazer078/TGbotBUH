@@ -311,7 +311,15 @@ async def get_ai_response(
             config=config,
         )
 
+        # Извлекаем текст — response.text может быть None при Google Search
         answer = response.text
+        if not answer:
+            try:
+                parts = response.candidates[0].content.parts
+                answer = "".join(p.text for p in parts if hasattr(p, 'text') and p.text)
+            except Exception:
+                answer = None
+        logger.info(f"[ai] Ответ получен, длина: {len(answer) if answer else 0} символов")
 
         # Обновляем историю
         if thread_id is not None:

@@ -15,17 +15,19 @@ def setup_scheduler():
     from bot.rag.news_parser import run_news_update
     from bot.rag.parser import check_for_updates
 
-    # ── 1. Ежедневный парсинг новостей ──────────────────────────────────────
+    # ── 1. Еженедельный парсинг новостей (каждый понедельник в 07:00 UTC) ────
+    # Для ручного запуска используйте команду /news в боте
     scheduler.add_job(
         run_news_update,
         trigger="cron",
+        day_of_week="mon",
         hour=7,
         minute=0,
-        id="daily_news_update",
+        id="weekly_news_update",
         replace_existing=True,
     )
 
-    # ── 2. Еженедельное обновление Налогового кодекса ────────────────────────
+    # ── 2. Еженедельное обновление Налогового кодекса (каждую пятницу в 03:00)
     scheduler.add_job(
         check_for_updates,
         trigger="cron",
@@ -39,6 +41,7 @@ def setup_scheduler():
     scheduler.start()
     logger.info(
         "APScheduler запущен: "
-        "📰 ежедневные новости в 07:00, "
-        "📚 обновление НК каждую пятницу в 03:00."
+        "📰 парсинг новостей каждый понедельник в 07:00 UTC, "
+        "📚 обновление НК каждую пятницу в 03:00 UTC. "
+        "Для ручного запуска: /news"
     )

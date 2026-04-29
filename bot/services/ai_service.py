@@ -82,7 +82,7 @@ egov.kz | enbek.gov.kz | stat.gov.kz | uchet.kz
 Данные только 2025–2026 года. Устаревшие ставки ЗАПРЕЩЕНЫ.
 
 ════════════════════════════════════
-ИСТОЧНИКИ (блок в конце каждого ответа):
+ИСТОЧНИКИ (блок в конце каждого ответа необезательно):
 <b>Источники:</b>
 • <a href="https://adilet.zan.kz/rus/docs/K2200000120">Налоговый кодекс РК</a>
 • <a href="https://kgd.gov.kz">КГД МФ РК — kgd.gov.kz</a>
@@ -325,6 +325,11 @@ async def get_ai_response(
                 answer = "".join(p.text for p in parts if hasattr(p, 'text') and p.text)
             except Exception:
                 answer = None
+                
+        # Конвертируем Markdown-жирный шрифт (**) в HTML (<b>)
+        if answer:
+            answer = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', answer)
+            
         logger.info(f"[ai] Ответ получен, длина: {len(answer) if answer else 0} символов")
 
         # Обновляем историю

@@ -141,7 +141,7 @@ def _calc_salary(gross: float) -> str:
     vosms  = round(min(gross, 10 * r["МЗП"]) * r["ВОСМС"])
     vychet = r["ВЫЧЕТ_МРП"] * r["МРП"]
     base   = max(0.0, gross - opv - vosms - vychet)
-    ipn    = round(base * r["ИПН"])
+    ipn    = round(base * r["ИПН_1"])  # 10% — базовая ставка до 8500 МРП/год
     netto  = round(gross - opv - vosms - ipn)
     so     = round(gross * r["СО"])
     osms   = round(gross * r["ОСМС"])
@@ -340,13 +340,22 @@ async def get_ai_response(
             config=config,
         )
 
-        # Извлекаем текст — response.text может быть None при Google Search
-        answer = response.text
+        # Извлекаем текст.
+        # ВАЖНО: в google-genai SDK response.text может БРОСИТЬ исключение
+        # (ValueError/AttributeError), а не вернуть None — особенно при Google Search.
+        # Поэтому оборачиваем в try/except и сразу переходим к ручному разбору.
+        answer = None
+        try:
+            answer = response.text
+        except Exception as e:
+            logger.warning(f"[ai] response.text недоступен: {e}")
+
         if not answer:
             try:
                 parts = response.candidates[0].content.parts
                 answer = "".join(p.text for p in parts if hasattr(p, 'text') and p.text)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[ai] Ручной разбор candidates не удался: {e}")
                 answer = None
                 
         # Конвертируем Markdown-жирный шрифт (**) в HTML (<b>)

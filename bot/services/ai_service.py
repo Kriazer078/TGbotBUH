@@ -278,7 +278,7 @@ async def get_ai_response(
         if query_embedding:
             # Запускаем все три запроса к Firebase одновременно
             rag_articles, similar_dialogs, news = await asyncio.gather(
-                asyncio.to_thread(search_similar_articles, query_embedding, 2),
+                search_similar_articles(query_embedding, 2),
                 asyncio.to_thread(get_similar_dialogs, query_embedding, 1),
                 asyncio.to_thread(get_recent_news, 2),
                 return_exceptions=True,

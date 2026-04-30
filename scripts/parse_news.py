@@ -67,6 +67,15 @@ def parse_and_save_news():
             title = html.unescape(entry.title)
             link = entry.link
 
+            # Фильтрация по ключевым словам для отсева нерелевантных новостей
+            ACCOUNTING_KEYWORDS = [
+                "закон", "кодекс", "налог", "бухгалтер", "учет", "изменени", 
+                "мрп", "мзп", "деклараци", "ндс", "ипн", "штраф", "отчетност"
+            ]
+            title_lower = title.lower()
+            if not any(kw in title_lower for kw in ACCOUNTING_KEYWORDS):
+                continue
+
             # Выбираем самый полный источник текста
             raw_text = ""
             if 'yandex_full-text' in entry:

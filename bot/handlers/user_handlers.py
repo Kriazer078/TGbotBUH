@@ -11,6 +11,7 @@ from aiogram.types import (
 from bot.services.ai_service import (
     get_ai_response,
     _calc_salary, _calc_nds, _calc_depreciation,
+    transcribe_voice,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ async def cmd_start(message: Message):
         "<b>Команды:</b>\n"
         "/calc — калькулятор для бухгалтера\n"
         "/rates — актуальные ставки 2026\n"
-        "/news — обновить базу новостей\n\n"
+        "/update_laws — ручной запуск парсинга законов (для админа)\n\n"
         "Просто напишите ваш вопрос или сумму для расчёта!"
     )
     await message.answer(welcome_text, parse_mode="HTML")
@@ -149,11 +150,16 @@ async def cmd_calc(message: Message):
         )
 
 
-# ── /news — обновление базы новостей ─────────────────────────────────────────
-@user_router.message(Command("news"))
-async def cmd_news(message: Message):
+# ── /update_laws — ручной запуск парсинга законодательства ────────────────────
+@user_router.message(Command("update_laws"))
+async def cmd_update_laws(message: Message):
     if not _is_allowed_thread(message): return
-    await message.answer("📰 Запускаю сбор свежих новостей…")
+    admin_id = os.getenv("ADMIN_ID", "6493072610")
+    if not admin_id or str(message.from_user.id) != admin_id:
+        await message.answer("⛔ У вас нет прав для использования этой команды.")
+        return
+
+    await message.answer("🔍 Запускаю ручной сбор законов и изменений для бухгалтеров…")
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     try:
         from bot.rag.news_parser import run_news_update
@@ -166,8 +172,8 @@ async def cmd_news(message: Message):
         else:
             await message.answer("ℹ️ Новых материалов не найдено — база актуальна.")
     except Exception as e:
-        logger.error(f"[/news] Ошибка: {e}")
-        await message.answer("⚠️ Ошибка при сборе новостей. Попробуйте позже.")
+        logger.error(f"[/update_laws] Ошибка: {e}")
+        await message.answer("⚠️ Ошибка при сборе данных. Попробуйте позже.")
 
 
 # ── /learn — обучение бота (только для админа) ────────────────────────────────
@@ -288,6 +294,53 @@ async def handle_rating(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"[rating] Ошибка: {e}")
         await callback.answer("⚠️ Ошибка при сохранении оценки.", show_alert=True)
+
+
+# ── Голосовые сообщения → транскрипция → AI ──────────────────────────────────
+@user_router.message(F.voice)
+async def handle_voice_message(message: Message):
+    if not _is_allowed_thread(message):
+        return
+
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    # Скачиваем голосовое сообщение
+    try:
+        voice_file = await message.bot.get_file(message.voice.file_id)
+        file_bytes = await message.bot.download_file(voice_file.file_path)
+        audio_data = file_bytes.read()
+    except Exception as e:
+        logger.error(f"[voice] Ошибка загрузки: {e}")
+        await message.answer("⚠️ Не удалось загрузить голосовое сообщение.")
+        return
+
+    # Транскрибируем через Gemini
+    user_query = await transcribe_voice(audio_data)
+    if not user_query:
+        await message.answer("⚠️ Не удалось распознать речь. Попробуйте написать текстом.")
+        return
+
+    logger.info(f"[voice] Транскрипция: {user_query[:80]}")
+    # Показываем распознанный текст
+    await message.answer(f"🎙 <i>{user_query}</i>", parse_mode="HTML")
+
+    # Передаём в обычный AI-пайплайн
+    thread_id = message.message_thread_id
+    user_id   = message.from_user.id
+    result = await get_ai_response(user_query, thread_id=thread_id, user_id=user_id)
+
+    if isinstance(result, tuple):
+        answer, doc_id = result
+    else:
+        answer, doc_id = result, None
+
+    reply_markup = _rating_keyboard(doc_id) if doc_id else None
+    await message.answer(
+        answer,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=reply_markup,
+    )
 
 
 # ── Любое текстовое сообщение → AI ───────────────────────────────────────────

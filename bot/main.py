@@ -50,11 +50,6 @@ async def main():
     # Регистрация роутеров
     dp.include_router(user_router)
 
-    from bot.rag.scheduler import setup_scheduler
-
-    # Запуск планировщика для автоматического обновления базы знаний
-    setup_scheduler()
-
     # Запуск polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)

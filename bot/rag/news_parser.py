@@ -56,14 +56,20 @@ def _make_id(url: str, title: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 UCHET_SECTIONS = [
-    "https://uchet.kz/news/",           # Новости
     "https://uchet.kz/articles/",       # Статьи
+    "https://uchet.kz/news/",           # Новости (будут фильтроваться)
 ]
 
+# Ключевые слова для фильтрации новостей, чтобы брать только законы, налоги и бухгалтерию
+ACCOUNTING_KEYWORDS = [
+    "закон", "кодекс", "налог", "бухгалтер", "учет", "изменени", 
+    "мрп", "мзп", "деклараци", "ндс", "ипн", "штраф", "отчетност"
+]
 
 def parse_uchet_kz(html: str, section_url: str) -> list[dict]:
     """
     Парсит список статей/новостей с uchet.kz.
+    Фильтрует по ключевым словам (законы, налоги, бухгалтерия).
     Возвращает список словарей с полями: title, text, url, source, date, article_id.
     """
     soup = BeautifulSoup(html, "html.parser")
@@ -77,11 +83,16 @@ def parse_uchet_kz(html: str, section_url: str) -> list[dict]:
         or soup.select(".entry-card")
     )
 
-    for card in cards[:20]:  # берём до 20 свежих карточек
+    for card in cards[:30]:  # берём больше карточек для фильтрации
         # ── Заголовок ──────────────────────────────────────────────────────
         title_tag = card.select_one("h2, h3, .article-title, .entry-title")
         title = title_tag.get_text(strip=True) if title_tag else ""
         if not title:
+            continue
+            
+        # Фильтрация по ключевым словам
+        title_lower = title.lower()
+        if not any(kw in title_lower for kw in ACCOUNTING_KEYWORDS):
             continue
 
         # ── Ссылка ─────────────────────────────────────────────────────────
@@ -107,7 +118,7 @@ def parse_uchet_kz(html: str, section_url: str) -> list[dict]:
             "date": date_str,
         })
 
-    logger.info(f"[uchet.kz] {section_url} → найдено {len(articles)} статей")
+    logger.info(f"[uchet.kz] {section_url} → найдено {len(articles)} статей (после фильтрации)")
     return articles
 
 

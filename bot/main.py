@@ -51,9 +51,13 @@ async def main():
     dp.include_router(user_router)
 
     # Запуск polling
+    # Ждём 3 сек после delete_webhook — Render делает rolling deploy и старый
+    # инстанс может ещё держать соединение. Пауза даёт Telegram время
+    # завершить старую сессию до начала новой.
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        await asyncio.sleep(3)
+        await dp.start_polling(bot, close_bot_session=True)
     finally:
         await bot.session.close()
 

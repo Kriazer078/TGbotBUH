@@ -110,7 +110,7 @@ async def transcribe_voice(audio_bytes: bytes) -> str | None:
         audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
         response = await asyncio.to_thread(
             _client.models.generate_content,
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[
                 {
                     "parts": [
@@ -309,9 +309,9 @@ async def get_ai_response(
 
         # ── 3. Запрос к Gemini ────────────────────────────────────────────────
         today  = datetime.now().strftime("%d.%m.%Y")
-        model  = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-        if model in ["gemini-1.5-flash", "gemini-1.5-pro", "text-embedding-004"]:
-            model = "gemini-2.0-flash"
+        model  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        if model in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "text-embedding-004"]:
+            model = "gemini-2.5-flash"
         system = _SYSTEM_INSTRUCTION.format(today=today)
 
         config = genai_types.GenerateContentConfig(

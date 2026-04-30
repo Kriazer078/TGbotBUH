@@ -103,12 +103,16 @@ async def search_similar_articles(query_embedding, top_k=3):
 
     # Если кэш пуст, загружаем базу в память (это делается один раз)
     if not _vector_cache:
-        docs = db.collection('knowledge_base').stream()
-        for doc in docs:
-            data = doc.to_dict()
-            if "embedding" in data:
-                _vector_cache.append(data)
-        logger.info(f"Загружено {len(_vector_cache)} документов в кэш для поиска.")
+        import asyncio
+        def load_cache():
+            docs = db.collection('knowledge_base').stream()
+            for doc in docs:
+                data = doc.to_dict()
+                if "embedding" in data:
+                    _vector_cache.append(data)
+            logger.info(f"Загружено {len(_vector_cache)} документов в кэш для поиска.")
+        
+        await asyncio.to_thread(load_cache)
 
     if not _vector_cache:
         return []

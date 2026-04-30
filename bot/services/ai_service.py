@@ -239,16 +239,20 @@ def _parse_and_calculate(text: str) -> str | None:
 
 async def embed_text(text: str) -> list:
     """Генерирует вектор текста через новый google-genai SDK."""
-    try:
-        result = await asyncio.to_thread(
-            _client.models.embed_content,
-            model="gemini-embedding-2",
-            contents=text,
-        )
-        return result.embeddings[0].values
-    except Exception as e:
-        logger.error(f"[embed] Ошибка: {e}")
-        return []
+    for attempt in range(3):
+        try:
+            result = await asyncio.to_thread(
+                _client.models.embed_content,
+                model="gemini-embedding-2",
+                contents=text,
+            )
+            return result.embeddings[0].values
+        except Exception as e:
+            logger.warning(f"[embed] Ошибка на попытке {attempt+1}: {e}")
+            if attempt == 2:
+                return []
+            await asyncio.sleep(1)
+    return []
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ГЛАВНАЯ ФУНКЦИЯ
@@ -333,12 +337,21 @@ async def get_ai_response(
             )
         ]
 
-        response = await asyncio.to_thread(
-            _client.models.generate_content,
-            model=model,
-            contents=messages,
-            config=config,
-        )
+        response = None
+        for attempt in range(3):
+            try:
+                response = await asyncio.to_thread(
+                    _client.models.generate_content,
+                    model=model,
+                    contents=messages,
+                    config=config,
+                )
+                break
+            except Exception as e:
+                logger.warning(f"[ai] Попытка {attempt+1} не удалась: {e}")
+                if attempt == 2:
+                    raise e
+                await asyncio.sleep(1.5)
 
         # Извлекаем текст.
         # ВАЖНО: в google-genai SDK response.text может БРОСИТЬ исключение

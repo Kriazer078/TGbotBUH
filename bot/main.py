@@ -51,12 +51,13 @@ async def main():
     dp.include_router(user_router)
 
     # Запуск polling
-    # Ждём 3 сек после delete_webhook — Render делает rolling deploy и старый
-    # инстанс может ещё держать соединение. Пауза даёт Telegram время
-    # завершить старую сессию до начала новой.
+    # Принудительно "выбиваем" любые старые сессии polling (например, от старого контейнера Render).
+    # Установка webhook моментально обрывает все активные getUpdates у других копий бота.
     try:
+        await bot.set_webhook("https://api.telegram.org/dummy_webhook_for_reset")
+        await asyncio.sleep(1)
         await bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         await dp.start_polling(bot, close_bot_session=True)
     finally:
         await bot.session.close()

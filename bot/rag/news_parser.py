@@ -14,6 +14,8 @@ from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +38,7 @@ REQUEST_TIMEOUT = 20  # секунд
 def _safe_get(url: str) -> Optional[str]:
     """Безопасный GET-запрос. Возвращает HTML или None при ошибке."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, verify=False)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding  # авто-определение кодировки
         return resp.text
@@ -206,6 +208,39 @@ async def fetch_adilet_news() -> list[dict]:
 # Главная функция: сбор всех новостей
 # ══════════════════════════════════════════════════════════════════════════════
 
+def extract_full_text(html: str, source: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    
+    if source == "uchet.kz":
+        for el in soup.select("script, style, .banner, .advert, .comments, header, footer"):
+            el.decompose()
+        content = soup.select_one(".article-content, .news-detail, .news_text, article, .content-container, main")
+        if not content:
+            content = soup.body
+    elif source == "adilet.zan.kz":
+        for el in soup.select("script, style, header, footer"):
+            el.decompose()
+        content = soup.select_one("#doc-content, .doc-content, article, .text")
+        if not content:
+            content = soup.body
+    else:
+        content = soup.body
+        
+    if content:
+        return content.get_text(separator="\n", strip=True)
+    return ""
+
+async def fetch_article_full_text(url: str, source: str, default_text: str) -> str:
+    if not url:
+        return default_text
+        
+    html = await asyncio.to_thread(_safe_get, url)
+    if html:
+        full_text = extract_full_text(html, source)
+        if len(full_text) > len(default_text):
+            return full_text
+    return default_text
+
 async def fetch_all_news() -> list[dict]:
     """
     Запускает параллельный сбор новостей со всех источников.
@@ -227,6 +262,15 @@ async def fetch_all_news() -> list[dict]:
         if item["article_id"] not in seen_ids:
             seen_ids.add(item["article_id"])
             unique_news.append(item)
+
+    logger.info(f"[news_parser] Сбор полных текстов для {len(unique_news)} статей...")
+    
+    async def process_item(item):
+        full_text = await fetch_article_full_text(item["url"], item["source"], item["text"])
+        item["text"] = f"{item['title']}\n\n{full_text}"
+        return item
+        
+    unique_news = await asyncio.gather(*(process_item(item) for item in unique_news))
 
     logger.info(
         f"[news_parser] Итого собрано {len(unique_news)} уникальных материалов "

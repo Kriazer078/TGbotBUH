@@ -368,10 +368,14 @@ def get_user_tasks(user_id: int) -> list[dict]:
             db.collection("user_tasks")
             .where(filter=FieldFilter("user_id", "==", user_id))
             .where(filter=FieldFilter("status", "==", "active"))
-            .order_by("created_at", direction=firestore.Query.ASCENDING)
             .stream()
         )
-        return [d.to_dict() | {"id": d.id} for d in docs]
+        tasks = [d.to_dict() | {"id": d.id} for d in docs]
+        
+        # Сортируем задачи по времени создания на стороне Python
+        tasks.sort(key=lambda x: x.get("created_at", datetime.min if isinstance(x.get("created_at"), str) else x.get("created_at", 0)))
+        
+        return tasks
     except Exception as e:
         logger.error(f"[tasks] Ошибка получения задач: {e}")
         return []

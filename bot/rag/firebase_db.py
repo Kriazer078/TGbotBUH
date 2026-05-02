@@ -318,3 +318,74 @@ def get_pending_reviews(limit: int = 10) -> list[dict]:
     except Exception as e:
         logger.error(f"[dialog] Ошибка получения проблемных диалогов: {e}")
         return []
+
+def save_feedback(user_id: int, text: str) -> bool:
+    """Сохраняет отзыв/пожелание пользователя."""
+    if not db:
+        return False
+    try:
+        doc_id = f"fb_{uuid.uuid4().hex[:8]}"
+        db.collection("feedbacks").document(doc_id).set({
+            "user_id": user_id,
+            "text": text,
+            "created_at": datetime.utcnow()
+        })
+        logger.info(f"[feedback] Отзыв сохранен от user {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"[feedback] Ошибка сохранения отзыва: {e}")
+        return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ЗАДАЧИ И НАПОМИНАНИЯ (ТАСК-ТРЕКЕР)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_user_task(user_id: int, task_text: str) -> bool:
+    """Сохраняет новую задачу/напоминание для конкретного пользователя."""
+    if not db:
+        return False
+    try:
+        doc_id = f"task_{uuid.uuid4().hex[:8]}"
+        db.collection("user_tasks").document(doc_id).set({
+            "user_id": user_id,
+            "text": task_text,
+            "created_at": datetime.utcnow(),
+            "status": "active"
+        })
+        logger.info(f"[tasks] Задача сохранена для user {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"[tasks] Ошибка сохранения задачи: {e}")
+        return False
+
+def get_user_tasks(user_id: int) -> list[dict]:
+    """Получает список активных задач пользователя."""
+    if not db:
+        return []
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        docs = (
+            db.collection("user_tasks")
+            .where(filter=FieldFilter("user_id", "==", user_id))
+            .where(filter=FieldFilter("status", "==", "active"))
+            .order_by("created_at", direction=firestore.Query.ASCENDING)
+            .stream()
+        )
+        return [d.to_dict() | {"id": d.id} for d in docs]
+    except Exception as e:
+        logger.error(f"[tasks] Ошибка получения задач: {e}")
+        return []
+
+def delete_user_task(task_id: str) -> bool:
+    """Помечает задачу как выполненную (удаляет из активных)."""
+    if not db:
+        return False
+    try:
+        db.collection("user_tasks").document(task_id).update({
+            "status": "done",
+            "done_at": datetime.utcnow()
+        })
+        return True
+    except Exception as e:
+        logger.error(f"[tasks] Ошибка завершения задачи: {e}")
+        return False

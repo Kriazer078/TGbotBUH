@@ -64,6 +64,9 @@ async def cmd_start(message: Message):
         "<b>Команды:</b>\n"
         "/calc — калькулятор для бухгалтера\n"
         "/rates — актуальные ставки 2026\n"
+        "/task [текст] — добавить личное напоминание/задачу\n"
+        "/tasks — посмотреть список своих задач\n"
+        "/feedback [текст] — отправить отзыв или пожелание\n"
         "/update_laws — ручной запуск парсинга законов (для админа)\n\n"
         "Просто напишите ваш вопрос или сумму для расчёта!"
     )
@@ -149,6 +152,115 @@ async def cmd_calc(message: Message):
             parse_mode="HTML"
         )
 
+
+# ── /feedback — обратная связь от пользователей ──────────────────────────────
+@user_router.message(Command("feedback"))
+async def cmd_feedback(message: Message):
+    if not _is_allowed_thread(message): return
+    
+    text = message.text.replace("/feedback", "", 1).strip()
+    if not text:
+        await message.answer(
+            "ℹ️ Напишите ваш отзыв или предложение после команды.\n"
+            "Пример: <code>/feedback Добавьте расчет отпускных</code>",
+            parse_mode="HTML"
+        )
+        return
+        
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        from bot.rag.firebase_db import save_feedback
+        import asyncio
+        success = await asyncio.to_thread(save_feedback, message.from_user.id, text)
+        
+        if success:
+            await message.answer("✅ <b>Спасибо за отзыв!</b> Ваше пожелание сохранено.", parse_mode="HTML")
+        else:
+            await message.answer("⚠️ Не удалось сохранить отзыв. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"[/feedback] Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка при отправке отзыва.")
+
+
+# ── /task — добавление задачи ────────────────────────────────────────────────
+@user_router.message(Command("task"))
+async def cmd_task(message: Message):
+    if not _is_allowed_thread(message): return
+    
+    text = message.text.replace("/task", "", 1).strip()
+    if not text:
+        await message.answer(
+            "ℹ️ Напишите задачу после команды.\n"
+            "Пример: <code>/task Сдать ФНО 910 до 15 мая</code>",
+            parse_mode="HTML"
+        )
+        return
+        
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        from bot.rag.firebase_db import save_user_task
+        import asyncio
+        success = await asyncio.to_thread(save_user_task, message.from_user.id, text)
+        
+        if success:
+            await message.answer("📝 <b>Задача сохранена!</b>\nПосмотреть список: /tasks", parse_mode="HTML")
+        else:
+            await message.answer("⚠️ Не удалось сохранить задачу. Попробуйте позже.")
+    except Exception as e:
+        logger.error(f"[/task] Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка.")
+
+# ── /tasks — просмотр списка задач ───────────────────────────────────────────
+@user_router.message(Command("tasks"))
+async def cmd_tasks(message: Message):
+    if not _is_allowed_thread(message): return
+    
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        from bot.rag.firebase_db import get_user_tasks
+        import asyncio
+        tasks = await asyncio.to_thread(get_user_tasks, message.from_user.id)
+        
+        if not tasks:
+            await message.answer("✅ У вас нет активных задач!")
+            return
+            
+        await message.answer(f"<b>📋 Ваши задачи ({len(tasks)}):</b>", parse_mode="HTML")
+        
+        for task in tasks:
+            # Создаем кнопку для выполнения задачи
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Выполнено", callback_data=f"done_task:{task['id']}")
+            ]])
+            await message.answer(
+                f"📌 {task['text']}",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+            
+    except Exception as e:
+        logger.error(f"[/tasks] Ошибка: {e}")
+        await message.answer("⚠️ Произошла ошибка при получении задач.")
+
+# ── Обработчик выполнения задачи ─────────────────────────────────────────────
+@user_router.callback_query(F.data.startswith("done_task:"))
+async def handle_done_task(callback: CallbackQuery):
+    try:
+        task_id = callback.data.split(":")[1]
+        from bot.rag.firebase_db import delete_user_task
+        import asyncio
+        success = await asyncio.to_thread(delete_user_task, task_id)
+        
+        if success:
+            await callback.answer("Задача выполнена!", show_alert=False)
+            # Обновляем сообщение, зачеркивая текст и убирая кнопку
+            old_text = callback.message.text.replace("📌 ", "", 1)
+            await callback.message.edit_text(f"<s>📌 {old_text}</s>", parse_mode="HTML", reply_markup=None)
+        else:
+            await callback.answer("⚠️ Ошибка. Попробуйте еще раз.", show_alert=True)
+    except Exception as e:
+        logger.error(f"[done_task] Ошибка: {e}")
+        await callback.answer("⚠️ Произошла ошибка.", show_alert=True)
 
 # ── /update_laws — ручной запуск парсинга законодательства ────────────────────
 @user_router.message(Command("update_laws"))

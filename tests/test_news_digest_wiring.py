@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 from bot.handlers.user_handlers import cmd_send_news
-from bot.main import register_weekly_digest_job
+from bot.main import register_weekly_digest_job, weekly_digest_endpoint
 from bot.services.news_digest_service import DigestItem, NewsCandidate, format_digest
 
 
@@ -14,6 +14,42 @@ class FakeScheduler:
 
     def add_job(self, *args, **kwargs):
         self.calls.append((args, kwargs))
+
+
+class FakeRequest:
+    def __init__(self, secret=None):
+        self.headers = {}
+        if secret is not None:
+            self.headers["X-Internal-Secret"] = secret
+
+
+class CloudSchedulerEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_when_server_secret_is_missing(self):
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "bot.services.news_digest_service.publish_digest", AsyncMock()
+        ) as publish:
+            response = await weekly_digest_endpoint(FakeRequest("provided"), object())
+
+        self.assertEqual(response.status, 401)
+        publish.assert_not_awaited()
+
+    async def test_rejects_missing_request_secret(self):
+        with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}), patch(
+            "bot.services.news_digest_service.publish_digest", AsyncMock()
+        ) as publish:
+            response = await weekly_digest_endpoint(FakeRequest(), object())
+
+        self.assertEqual(response.status, 401)
+        publish.assert_not_awaited()
+
+    async def test_rejects_incorrect_request_secret(self):
+        with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}), patch(
+            "bot.services.news_digest_service.publish_digest", AsyncMock()
+        ) as publish:
+            response = await weekly_digest_endpoint(FakeRequest("incorrect"), object())
+
+        self.assertEqual(response.status, 401)
+        publish.assert_not_awaited()
 
 
 class SchedulerWiringTests(unittest.TestCase):

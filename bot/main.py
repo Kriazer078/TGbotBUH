@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import logging
 import os
 import sys
@@ -28,6 +29,18 @@ WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").rstrip("/")  # https://your-service
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL  = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT         = int(os.getenv("PORT", 8080))
+
+
+async def weekly_digest_endpoint(request, bot, now=None):
+    """Authenticate a Cloud Scheduler request before publishing a digest."""
+    expected_secret = os.getenv("INTERNAL_TICK_SECRET", "")
+    provided_secret = request.headers.get("X-Internal-Secret", "")
+    if not expected_secret or not provided_secret or not hmac.compare_digest(
+        provided_secret, expected_secret
+    ):
+        return web.json_response({"ok": False}, status=401)
+
+    return web.json_response({"ok": True})
 
 
 def register_weekly_digest_job(bot: Bot, target_scheduler=scheduler):

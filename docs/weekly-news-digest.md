@@ -15,6 +15,7 @@ NEWS_TIMEZONE=Asia/Almaty
 NEWS_ADMIN_TEST_MODE=false
 NEWS_AI_TIMEOUT_SECONDS=30
 NEWS_CLAIM_LEASE_MINUTES=30
+INTERNAL_TICK_SECRET=<случайный секрет>
 NEWS_ALLOWED_DOMAINS=nationalbank.kz,kgd.gov.kz,gov.kz,stat.gov.kz,uchet.kz,forbes.kz,kursiv.media,kapital.kz
 NEWS_WORLD_DOMAINS=reuters.com,bloomberg.com,ft.com,worldbank.org,imf.org
 ```
@@ -33,3 +34,20 @@ NEWS_WORLD_DOMAINS=reuters.com,bloomberg.com,ft.com,worldbank.org,imf.org
 Успешные публикации записываются в коллекцию Firebase
 `news_digest_publications`, поэтому повторная публикация за ту же дату
 блокируется.
+
+## Запуск в Cloud Run
+
+В production понедельничную публикацию запускает Google Cloud Scheduler, а не
+внутренний APScheduler процесса. Поэтому Cloud Run может безопасно уменьшать
+число экземпляров до нуля между запросами.
+
+- Задание: `weekly-business-digest`
+- Расписание: `30 9 * * 1`
+- Часовой пояс: `Asia/Almaty`
+- Метод и путь: `POST /internal/weekly-digest`
+- Защита: заголовок `X-Internal-Secret` со значением `INTERNAL_TICK_SECRET`
+
+При временной ошибке Cloud Scheduler повторяет запрос. Атомарная запись в
+`news_digest_publications` не позволяет повторно отправить выпуск за ту же
+дату. Внутренний APScheduler продолжает только обновлять новостной кэш каждые
+шесть часов.

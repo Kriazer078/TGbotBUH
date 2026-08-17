@@ -17,6 +17,9 @@ class FakeScheduler:
     def add_job(self, *args, **kwargs):
         self.calls.append((args, kwargs))
 
+    def start(self):
+        return None
+
 
 class FakeRequest:
     def __init__(self, secret=None):
@@ -93,7 +96,7 @@ class CloudSchedulerEndpointTests(unittest.IsolatedAsyncioTestCase):
         publish.assert_not_awaited()
 
 
-class SchedulerWiringTests(unittest.TestCase):
+class SchedulerWiringTests(unittest.IsolatedAsyncioTestCase):
     def test_registers_monday_job_at_0930_almaty(self):
         scheduler = FakeScheduler()
 
@@ -106,6 +109,21 @@ class SchedulerWiringTests(unittest.TestCase):
         self.assertEqual(kwargs["hour"], 9)
         self.assertEqual(kwargs["minute"], 30)
         self.assertEqual(kwargs["timezone"], "Asia/Almaty")
+
+    async def test_startup_does_not_register_weekly_in_process_job(self):
+        scheduler = FakeScheduler()
+        bot = AsyncMock()
+
+        with patch("bot.main.scheduler", scheduler), patch(
+            "bot.rag.firebase_db.init_firebase", return_value=False
+        ), patch("bot.main.register_weekly_digest_job") as register_weekly:
+            from bot.main import on_startup
+
+            await on_startup(bot)
+
+        register_weekly.assert_not_called()
+        registered_ids = [kwargs["id"] for _, kwargs in scheduler.calls]
+        self.assertEqual(registered_ids, ["news_update"])
 
 
 class FakeUser:

@@ -154,12 +154,8 @@ async def on_startup(bot: Bot):
             logger.error(f"[scheduler] Ошибка обновления новостей: {e}")
 
     scheduler.add_job(_news_job, "interval", hours=6, id="news_update", replace_existing=True)
-    register_weekly_digest_job(bot)
     scheduler.start()
-    logger.info(
-        "Планировщик запущен: сбор каждые 6 часов, "
-        "подборка по понедельникам в 09:30."
-    )
+    logger.info("Планировщик запущен: сбор новостей каждые 6 часов.")
 
     await bot.set_webhook(WEBHOOK_URL)
     logger.info(f"Webhook установлен: {WEBHOOK_URL}")

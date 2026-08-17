@@ -1,10 +1,19 @@
+import asyncio
+import html
+import json
+import logging
+import os
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 from dateutil import parser as date_parser
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -16,6 +25,22 @@ class NewsCandidate:
     source: str
     published_at: datetime
     is_world: bool = False
+
+
+@dataclass(frozen=True)
+class DigestItem:
+    candidate: NewsCandidate
+    summary: str
+    importance: str
+
+
+GREETINGS = (
+    "Доброе утро! ☀️ Пусть новая неделя начнётся спокойно, продуктивно и с хороших новостей.",
+    "Доброе утро! 🌤 Желаем лёгкого старта недели и уверенных решений.",
+    "С добрым утром! ☕ Начинаем неделю с главных событий экономики и бизнеса.",
+    "Доброе утро! 📈 Пусть эта неделя принесёт полезные идеи и хорошие результаты.",
+    "С понедельником! ☀️ Коротко и понятно рассказываем, что произошло за последние сутки.",
+)
 
 
 def _parse_date(value: str) -> datetime | None:
@@ -105,3 +130,118 @@ def normalize_candidates(
             accepted[duplicate_index] = candidate
 
     return sorted(accepted, key=lambda item: item.published_at, reverse=True)
+
+
+def _clean_json_payload(payload: str) -> str:
+    return re.sub(
+        r"^```(?:json)?|```$",
+        "",
+        payload.strip(),
+        flags=re.MULTILINE,
+    ).strip()
+
+
+def parse_ranked_items(
+    payload: str,
+    candidates: list[NewsCandidate],
+) -> tuple[list[DigestItem], str]:
+    data = json.loads(_clean_json_payload(payload))
+    by_url = {item.url: item for item in candidates}
+    selected: list[DigestItem] = []
+    world_count = 0
+
+    for raw in data.get("items", []):
+        candidate = by_url.get(_canonical_url(str(raw.get("url", ""))))
+        if candidate is None or any(
+            item.candidate.article_id == candidate.article_id for item in selected
+        ):
+            continue
+        if candidate.is_world and world_count >= 2:
+            continue
+        summary = str(raw.get("summary", "")).strip()
+        importance = str(raw.get("importance", "")).strip()
+        if not summary or not importance:
+            continue
+        selected.append(DigestItem(candidate, summary, importance))
+        world_count += int(candidate.is_world)
+        if len(selected) == 5:
+            break
+
+    return selected, str(data.get("overview", "")).strip()
+
+
+def format_digest(
+    items: list[DigestItem],
+    overview: str,
+    greeting: str | None = None,
+) -> str:
+    parts = [
+        html.escape(greeting or random.choice(GREETINGS)),
+        "<b>Главное в экономике и бизнесе за последние 24 часа:</b>",
+    ]
+    digest_timezone = ZoneInfo(os.getenv("NEWS_TIMEZONE", "Asia/Almaty"))
+    for index, item in enumerate(items, 1):
+        flag = "🌍" if item.candidate.is_world else "🇰🇿"
+        local_time = item.candidate.published_at.astimezone(digest_timezone).strftime(
+            "%H:%M"
+        )
+        parts.append(
+            f"{flag} <b>{index}. {html.escape(item.candidate.title)}</b>\n\n"
+            f"{html.escape(item.summary)}\n\n"
+            f"<b>Почему важно:</b> {html.escape(item.importance)}\n\n"
+            f'🔗 <a href="{html.escape(item.candidate.url, quote=True)}">'
+            f"{html.escape(item.candidate.source)}</a> · {local_time}"
+        )
+    if overview:
+        parts.append(f"<b>Коротко о главном:</b> {html.escape(overview)}")
+    parts.append("Хорошей и успешной недели! 🚀")
+    return "\n\n".join(parts)
+
+
+async def rank_and_summarize(
+    candidates: list[NewsCandidate],
+    client=None,
+) -> tuple[list[DigestItem], str]:
+    if client is None:
+        from google import genai
+
+        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    gemini_client = client
+    candidate_data = [
+        {
+            "title": item.title,
+            "text": item.text[:2500],
+            "url": item.url,
+            "source": item.source,
+            "published_at": item.published_at.isoformat(),
+            "scope": "world" if item.is_world else "kazakhstan",
+        }
+        for item in candidates[:30]
+    ]
+    prompt = (
+        "Выбери до 5 важнейших новостей экономики и бизнеса. "
+        "Казахстан имеет приоритет; мировых новостей максимум две. "
+        "Используй только переданные URL. Для каждой дай summary из 2–3 "
+        "коротких предложений и importance — одно практическое предложение. "
+        'Верни только JSON: {"items":[{"url":"...","summary":"...",'
+        '"importance":"..."}],"overview":"одна строка"}. Данные:\n'
+        + json.dumps(candidate_data, ensure_ascii=False)
+    )
+
+    for attempt in range(2):
+        try:
+            response = await gemini_client.aio.models.generate_content(
+                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                contents=prompt,
+                config={"temperature": 0.1, "max_output_tokens": 1800},
+            )
+            return parse_ranked_items(response.text or "{}", candidates)
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            logger.warning(
+                "[weekly_digest] Ошибка ранжирования, попытка %s: %s",
+                attempt + 1,
+                exc,
+            )
+            if attempt == 0:
+                await asyncio.sleep(1)
+    return [], ""

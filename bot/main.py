@@ -1,7 +1,10 @@
 import asyncio
+import hmac
 import logging
 import os
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -28,6 +31,50 @@ WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "").rstrip("/")  # https://your-service
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL  = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT         = int(os.getenv("PORT", 8080))
+
+
+async def weekly_digest_endpoint(request, bot, now=None):
+    """Authenticate a Cloud Scheduler request before publishing a digest."""
+    expected_secret = os.getenv("INTERNAL_TICK_SECRET", "")
+    provided_secret = request.headers.get("X-Internal-Secret", "")
+    if not expected_secret or not provided_secret or not hmac.compare_digest(
+        provided_secret, expected_secret
+    ):
+        return web.json_response({"ok": False}, status=401)
+
+    from bot.services.news_digest_service import publish_digest
+
+    timezone_name = os.getenv("NEWS_TIMEZONE", "Asia/Almaty")
+    current_time = now or datetime.now(ZoneInfo(timezone_name))
+    publication_key = current_time.astimezone(ZoneInfo(timezone_name)).date().isoformat()
+    try:
+        await publish_digest(
+            bot,
+            chat_id=int(os.getenv("NEWS_TARGET_CHAT_ID", "-1002318310296")),
+            thread_id=int(os.getenv("NEWS_TARGET_THREAD_ID", "1")),
+            publication_key=publication_key,
+            test_mode=False,
+        )
+    except Exception:
+        logger.exception("[weekly_digest] Cloud Scheduler publication failed")
+        return web.json_response({"ok": False}, status=500)
+
+    return web.json_response({"ok": True})
+
+
+def create_app(bot: Bot, dispatcher: Dispatcher):
+    """Build the aiohttp application and register external/internal routes."""
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dispatcher, bot=bot).register(
+        app, path=WEBHOOK_PATH
+    )
+
+    async def _weekly_digest_handler(request):
+        return await weekly_digest_endpoint(request, bot)
+
+    app.router.add_post("/internal/weekly-digest", _weekly_digest_handler)
+    setup_application(app, dispatcher, bot=bot)
+    return app
 
 
 def register_weekly_digest_job(bot: Bot, target_scheduler=scheduler):
@@ -107,12 +154,8 @@ async def on_startup(bot: Bot):
             logger.error(f"[scheduler] Ошибка обновления новостей: {e}")
 
     scheduler.add_job(_news_job, "interval", hours=6, id="news_update", replace_existing=True)
-    register_weekly_digest_job(bot)
     scheduler.start()
-    logger.info(
-        "Планировщик запущен: сбор каждые 6 часов, "
-        "подборка по понедельникам в 09:30."
-    )
+    logger.info("Планировщик запущен: сбор новостей каждые 6 часов.")
 
     await bot.set_webhook(WEBHOOK_URL)
     logger.info(f"Webhook установлен: {WEBHOOK_URL}")
@@ -142,9 +185,7 @@ def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
+    app = create_app(bot, dp)
 
     logger.info(f"Запуск веб-сервера на порту {PORT}...")
     web.run_app(app, host="0.0.0.0", port=PORT)

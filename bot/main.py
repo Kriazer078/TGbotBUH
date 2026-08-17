@@ -3,6 +3,8 @@ import hmac
 import logging
 import os
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -40,7 +42,39 @@ async def weekly_digest_endpoint(request, bot, now=None):
     ):
         return web.json_response({"ok": False}, status=401)
 
+    from bot.services.news_digest_service import publish_digest
+
+    timezone_name = os.getenv("NEWS_TIMEZONE", "Asia/Almaty")
+    current_time = now or datetime.now(ZoneInfo(timezone_name))
+    publication_key = current_time.astimezone(ZoneInfo(timezone_name)).date().isoformat()
+    try:
+        await publish_digest(
+            bot,
+            chat_id=int(os.getenv("NEWS_TARGET_CHAT_ID", "-1002318310296")),
+            thread_id=int(os.getenv("NEWS_TARGET_THREAD_ID", "1")),
+            publication_key=publication_key,
+            test_mode=False,
+        )
+    except Exception:
+        logger.exception("[weekly_digest] Cloud Scheduler publication failed")
+        return web.json_response({"ok": False}, status=500)
+
     return web.json_response({"ok": True})
+
+
+def create_app(bot: Bot, dispatcher: Dispatcher):
+    """Build the aiohttp application and register external/internal routes."""
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dispatcher, bot=bot).register(
+        app, path=WEBHOOK_PATH
+    )
+
+    async def _weekly_digest_handler(request):
+        return await weekly_digest_endpoint(request, bot)
+
+    app.router.add_post("/internal/weekly-digest", _weekly_digest_handler)
+    setup_application(app, dispatcher, bot=bot)
+    return app
 
 
 def register_weekly_digest_job(bot: Bot, target_scheduler=scheduler):
@@ -155,9 +189,7 @@ def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    app = web.Application()
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
+    app = create_app(bot, dp)
 
     logger.info(f"Запуск веб-сервера на порту {PORT}...")
     web.run_app(app, host="0.0.0.0", port=PORT)

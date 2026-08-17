@@ -3,8 +3,10 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+from aiogram import Dispatcher
+
 from bot.handlers.user_handlers import cmd_send_news
-from bot.main import register_weekly_digest_job, weekly_digest_endpoint
+from bot.main import create_app, register_weekly_digest_job, weekly_digest_endpoint
 from bot.services.news_digest_service import DigestItem, NewsCandidate, format_digest
 
 
@@ -32,6 +34,45 @@ class CloudSchedulerEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status, 401)
         publish.assert_not_awaited()
+
+    async def test_valid_request_publishes_to_configured_topic(self):
+        fixed_now = datetime(2026, 8, 17, 4, 30, tzinfo=timezone.utc)
+        environment = {
+            "INTERNAL_TICK_SECRET": "expected",
+            "NEWS_TARGET_CHAT_ID": "-1002318310296",
+            "NEWS_TARGET_THREAD_ID": "1",
+            "NEWS_TIMEZONE": "Asia/Almaty",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "bot.services.news_digest_service.publish_digest", AsyncMock(return_value=True)
+        ) as publish:
+            response = await weekly_digest_endpoint(
+                FakeRequest("expected"), object(), now=fixed_now
+            )
+
+        self.assertEqual(response.status, 200)
+        publish.assert_awaited_once_with(
+            unittest.mock.ANY,
+            chat_id=-1002318310296,
+            thread_id=1,
+            publication_key="2026-08-17",
+            test_mode=False,
+        )
+
+    async def test_publication_failure_returns_500(self):
+        with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}), patch(
+            "bot.services.news_digest_service.publish_digest",
+            AsyncMock(side_effect=RuntimeError("failure")),
+        ):
+            response = await weekly_digest_endpoint(FakeRequest("expected"), object())
+
+        self.assertEqual(response.status, 500)
+
+    async def test_app_registers_internal_post_route(self):
+        app = create_app(object(), Dispatcher())
+
+        routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
+        self.assertIn(("POST", "/internal/weekly-digest"), routes)
 
     async def test_rejects_missing_request_secret(self):
         with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}), patch(

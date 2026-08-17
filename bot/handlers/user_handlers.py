@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import os
+import time as _time
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -10,9 +12,12 @@ from aiogram.types import (
 
 from bot.services.ai_service import (
     get_ai_response,
+    stream_ai_response,
     _calc_salary, _calc_nds, _calc_depreciation,
+    _calc_penalty, _calc_vacation, _calc_sick_leave,
     transcribe_voice,
 )
+from bot.services.currency_service import format_rate_message, convert_to_tenge
 
 logger = logging.getLogger(__name__)
 user_router = Router()
@@ -58,16 +63,17 @@ async def cmd_start(message: Message):
         "🔹 Консультации по НК РК, ТК РК\n"
         "🔹 Расчёт ЗП, ИПН, ОПВ, ВОСМС, СО\n"
         "🔹 Расчёт НДС (16%) — начисление и выделение\n"
-        "🔹 Расчёт амортизации ОС\n"
+        "🔹 Расчёт амортизации, пеней, отпускных, больничных\n"
+        "🔹 Курс валют НБК — USD, EUR, RUB, CNY\n"
         "🔹 Поиск по официальным источникам РК (Google Search)\n"
         "🔹 Обучение на ваших оценках 👍/👎\n\n"
         "<b>Команды:</b>\n"
-        "/calc — калькулятор для бухгалтера\n"
+        "/calc — калькулятор (ЗП, НДС, пени, отпускные, больничные)\n"
         "/rates — актуальные ставки 2026\n"
+        "/usd /eur /rub /cny — курс валют НБК\n"
         "/task [текст] — добавить личное напоминание/задачу\n"
         "/tasks — посмотреть список своих задач\n"
-        "/feedback [текст] — отправить отзыв или пожелание\n"
-        "/update_laws — ручной запуск парсинга законов (для админа)\n\n"
+        "/feedback [текст] — отправить отзыв или пожелание\n\n"
         "Просто напишите ваш вопрос или сумму для расчёта!"
     )
     await message.answer(welcome_text, parse_mode="HTML")
@@ -117,7 +123,16 @@ async def cmd_calc(message: Message):
             "<code>/calc ндс 560000 с ндс</code>\n\n"
             "<b>Расчёт амортизации:</b>\n"
             "<code>/calc амортизация 1200000 0 5</code>\n"
-            "<i>(стоимость, остаточная стоимость, лет)</i>"
+            "<i>(стоимость, остаточная стоимость, лет)</i>\n\n"
+            "<b>Расчёт пени за просрочку:</b>\n"
+            "<code>/calc пеня 500000 30</code>\n"
+            "<i>(сумма долга, дней просрочки)</i>\n\n"
+            "<b>Расчёт отпускных:</b>\n"
+            "<code>/calc отпускные 300000 24</code>\n"
+            "<i>(среднемесячная ЗП, дней отпуска)</i>\n\n"
+            "<b>Расчёт больничных:</b>\n"
+            "<code>/calc больничные 300000 10</code>\n"
+            "<i>(среднемесячная ЗП, дней болезни)</i>"
         )
         await message.answer(help_text, parse_mode="HTML")
         return
@@ -142,6 +157,17 @@ async def cmd_calc(message: Message):
             result = _calc_depreciation(nums[0], nums[1], int(nums[2]))
         elif len(nums) == 2:
             result = _calc_depreciation(nums[0], 0, int(nums[1]))
+    elif any(k in t for k in ["пен", "просрочк"]):
+        if len(nums) >= 2:
+            result = _calc_penalty(nums[0], int(nums[1]))
+    elif any(k in t for k in ["отпускн", "отпуск"]):
+        if len(nums) >= 2:
+            result = _calc_vacation(nums[0], int(nums[1]))
+        elif len(nums) == 1:
+            result = _calc_vacation(nums[0], 24)
+    elif any(k in t for k in ["больничн", "болезн"]):
+        if len(nums) >= 2:
+            result = _calc_sick_leave(nums[0], int(nums[1]))
 
     if result:
         await message.answer(result, parse_mode="HTML")
@@ -261,6 +287,87 @@ async def handle_done_task(callback: CallbackQuery):
     except Exception as e:
         logger.error(f"[done_task] Ошибка: {e}")
         await callback.answer("⚠️ Произошла ошибка.", show_alert=True)
+
+# ── /usd /eur /rub /cny — курс валют НБК ────────────────────────────────────
+@user_router.message(Command("usd", "eur", "rub", "cny", "gbp"))
+async def cmd_currency(message: Message):
+    if not _is_allowed_thread(message): return
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+
+    # Определяем валюту из команды
+    cmd = message.text.split()[0].lstrip("/").upper().split("@")[0]
+
+    # Проверяем: может быть конвертация "/usd 1500"
+    args = message.text.split()
+    if len(args) >= 2:
+        try:
+            amount = float(args[1].replace(",", "."))
+            result = await asyncio.to_thread(convert_to_tenge, amount, cmd)
+            if result:
+                await message.answer(result, parse_mode="HTML")
+                return
+        except ValueError:
+            pass
+
+    result = await asyncio.to_thread(format_rate_message, cmd)
+    await message.answer(result, parse_mode="HTML")
+
+
+# ── /update_laws — ручной запуск парсинга законодательства ────────────────────
+@user_router.message(Command("send_news"))
+async def cmd_send_news(message: Message):
+    """Показывает подборку админу; аргумент live публикует её в целевой теме."""
+    admin_id = os.getenv("ADMIN_ID", "")
+    if not admin_id or str(message.from_user.id) != admin_id:
+        await message.answer("⛔ У вас нет прав для использования этой команды.")
+        return
+
+    args = message.text.lower().split()[1:]
+    live = "live" in args
+    await message.answer("🔍 Формирую проверенную подборку за последние 24 часа…")
+
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bot.services.news_digest_service import (
+            build_digest,
+            publish_digest,
+            split_digest,
+        )
+
+        if live:
+            timezone_name = os.getenv("NEWS_TIMEZONE", "Asia/Almaty")
+            published = await publish_digest(
+                message.bot,
+                chat_id=int(
+                    os.getenv("NEWS_TARGET_CHAT_ID", "-1002318310296")
+                ),
+                thread_id=int(os.getenv("NEWS_TARGET_THREAD_ID", "1")),
+                publication_key=datetime.now(
+                    ZoneInfo(timezone_name)
+                ).date().isoformat(),
+            )
+            if published:
+                await message.answer("✅ Подборка опубликована в целевой теме.")
+            else:
+                await message.answer("ℹ️ Сегодняшняя подборка уже была опубликована.")
+            return
+
+        preview, _ = await build_digest()
+        for chunk in split_digest(preview):
+            await message.answer(
+                chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+    except Exception as exc:
+        logger.exception("[/send_news] Ошибка: %s", exc)
+        await message.answer(
+            "⚠️ Не удалось сформировать подборку. "
+            "Проверьте источники и повторите позже."
+        )
+
 
 # ── /update_laws — ручной запуск парсинга законодательства ────────────────────
 @user_router.message(Command("update_laws"))
@@ -408,7 +515,57 @@ async def handle_rating(callback: CallbackQuery):
         await callback.answer("⚠️ Ошибка при сохранении оценки.", show_alert=True)
 
 
-# ── Голосовые сообщения → транскрипция → AI ──────────────────────────────────
+# ── Вспомогательная функция стриминга ────────────────────────────────────────
+async def _stream_and_send(message: Message, user_query: str, thread_id: int, user_id: int):
+    """Отправляет плейсхолдер, стримит ответ Gemini, редактирует по мере поступления."""
+    sent = await message.answer("⏳")
+    accumulated = ""
+    last_edit = _time.time()
+    doc_id = None
+
+    try:
+        async for chunk in stream_ai_response(user_query, thread_id=thread_id, user_id=user_id):
+            # Финальные состояния
+            if isinstance(chunk, tuple):
+                kind = chunk[0]
+                if kind in ("done", "cached"):
+                    accumulated, doc_id = chunk[1], chunk[2]
+                elif kind == "calc":
+                    await sent.edit_text(chunk[1], parse_mode="HTML")
+                    return
+                break
+
+            # Обычный текстовый кусок
+            accumulated += chunk
+            now = _time.time()
+            if now - last_edit >= 1.0 and accumulated.strip():
+                try:
+                    await sent.edit_text(
+                        accumulated + " ▌",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    last_edit = now
+                except Exception:
+                    pass
+
+        # Финальное редактирование с кнопками оценки
+        reply_markup = _rating_keyboard(doc_id) if doc_id else None
+        await sent.edit_text(
+            accumulated or "⚠️ Не удалось получить ответ.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        logger.error(f"[stream_and_send] {e}")
+        try:
+            await sent.edit_text("⚠️ Произошла ошибка. Попробуйте ещё раз.")
+        except Exception:
+            pass
+
+
+# ── Голосовые сообщения → транскрипция → стриминг AI ─────────────────────────
 @user_router.message(F.voice)
 async def handle_voice_message(message: Message):
     if not _is_allowed_thread(message):
@@ -416,7 +573,6 @@ async def handle_voice_message(message: Message):
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-    # Скачиваем голосовое сообщение
     try:
         voice_file = await message.bot.get_file(message.voice.file_id)
         file_bytes = await message.bot.download_file(voice_file.file_path)
@@ -426,67 +582,26 @@ async def handle_voice_message(message: Message):
         await message.answer("⚠️ Не удалось загрузить голосовое сообщение.")
         return
 
-    # Транскрибируем через Gemini
     user_query = await transcribe_voice(audio_data)
     if not user_query:
         await message.answer("⚠️ Не удалось распознать речь. Попробуйте написать текстом.")
         return
 
     logger.info(f"[voice] Транскрипция: {user_query[:80]}")
-    # Показываем распознанный текст
     await message.answer(f"🎙 <i>{user_query}</i>", parse_mode="HTML")
 
-    # Передаём в обычный AI-пайплайн
-    thread_id = message.message_thread_id
-    user_id   = message.from_user.id
-    result = await get_ai_response(user_query, thread_id=thread_id, user_id=user_id)
-
-    if isinstance(result, tuple):
-        answer, doc_id = result
-    else:
-        answer, doc_id = result, None
-
-    reply_markup = _rating_keyboard(doc_id) if doc_id else None
-    await message.answer(
-        answer,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=reply_markup,
-    )
+    await _stream_and_send(message, user_query, message.message_thread_id, message.from_user.id)
 
 
-# ── Любое текстовое сообщение → AI ───────────────────────────────────────────
+# ── Любое текстовое сообщение → стриминг AI ──────────────────────────────────
 @user_router.message(F.text)
 async def handle_user_message(message: Message):
     if not _is_allowed_thread(message):
         return
 
-    thread_id = message.message_thread_id
+    thread_id  = message.message_thread_id
     user_query = message.text
     user_id    = message.from_user.id
     logger.info(f"Запрос от {user_id} в теме {thread_id}: {user_query[:80]}")
 
-    allowed_ids_str = os.getenv("ALLOWED_THREAD_ID", "")
-    if not allowed_ids_str:
-        logger.info(f"Hint: добавьте в .env ALLOWED_THREAD_ID={thread_id} (или несколько через запятую)")
-
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-
-    result = await get_ai_response(user_query, thread_id=thread_id, user_id=user_id)
-
-    # get_ai_response возвращает (answer, doc_id) или просто строку (калькулятор)
-    if isinstance(result, tuple):
-        answer, doc_id = result
-    else:
-        answer  = result
-        doc_id  = None
-
-    # Кнопки оценки (только если ответ от ИИ, не калькулятор)
-    reply_markup = _rating_keyboard(doc_id) if doc_id else None
-
-    await message.answer(
-        answer,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-        reply_markup=reply_markup,
-    )
+    await _stream_and_send(message, user_query, thread_id, user_id)

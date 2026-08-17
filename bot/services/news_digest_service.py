@@ -12,6 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
 logger = logging.getLogger(__name__)
@@ -42,17 +43,45 @@ GREETINGS = (
     "Доброе утро! 📈 Пусть эта неделя принесёт полезные идеи и хорошие результаты.",
     "С понедельником! ☀️ Коротко и понятно рассказываем, что произошло за последние сутки.",
 )
+DIGEST_SECTION_SEPARATOR = "\n\n──────────\n\n"
+
+
+def digest_schedule(env: dict[str, str] | None = None) -> dict:
+    values = os.environ if env is None else env
+    raw_time = values.get("NEWS_SCHEDULE_TIME", "09:30")
+    try:
+        hour_text, minute_text = raw_time.split(":", 1)
+        hour, minute = int(hour_text), int(minute_text)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("NEWS_SCHEDULE_TIME must use HH:MM format") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("NEWS_SCHEDULE_TIME must use HH:MM format")
+    return {
+        "day_of_week": values.get("NEWS_SCHEDULE_DAY", "mon"),
+        "hour": hour,
+        "minute": minute,
+        "timezone": values.get("NEWS_TIMEZONE", "Asia/Almaty"),
+    }
 
 
 def _parse_date(value: str) -> datetime | None:
-    if not value:
+    has_time = re.search(r"\d{1,2}:\d{2}", value or "")
+    has_date = re.search(
+        r"(?:\d{4}-\d{1,2}-\d{1,2}|"
+        r"\d{1,2}[./]\d{1,2}[./]\d{2,4}|"
+        r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})",
+        value or "",
+    )
+    if not value or not has_time or not has_date:
         return None
     try:
         parsed = date_parser.parse(value)
     except (TypeError, ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(
+            tzinfo=ZoneInfo(os.getenv("NEWS_TIMEZONE", "Asia/Almaty"))
+        )
     return parsed.astimezone(timezone.utc)
 
 
@@ -147,6 +176,8 @@ def parse_ranked_items(
     candidates: list[NewsCandidate],
 ) -> tuple[list[DigestItem], str]:
     data = json.loads(_clean_json_payload(payload))
+    if not isinstance(data, dict):
+        raise ValueError("Gemini response must be a JSON object")
     by_url = {item.url: item for item in candidates}
     selected: list[DigestItem] = []
     world_count = 0
@@ -171,14 +202,22 @@ def parse_ranked_items(
     return selected, str(data.get("overview", "")).strip()
 
 
+def _clip_text(value: str, limit: int) -> str:
+    cleaned = " ".join(value.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    shortened = cleaned[: limit - 1].rsplit(" ", 1)[0].rstrip(".,;:—- ")
+    return f"{shortened}…"
+
+
 def format_digest(
     items: list[DigestItem],
     overview: str,
     greeting: str | None = None,
 ) -> str:
-    parts = [
-        html.escape(greeting or random.choice(GREETINGS)),
-        "<b>Главное в экономике и бизнесе за последние 24 часа:</b>",
+    sections = [
+        f"{html.escape(greeting or random.choice(GREETINGS))}\n\n"
+        "<b>Главное в экономике и бизнесе за последние 24 часа:</b>"
     ]
     digest_timezone = ZoneInfo(os.getenv("NEWS_TIMEZONE", "Asia/Almaty"))
     for index, item in enumerate(items, 1):
@@ -186,17 +225,22 @@ def format_digest(
         local_time = item.candidate.published_at.astimezone(digest_timezone).strftime(
             "%H:%M"
         )
-        parts.append(
-            f"{flag} <b>{index}. {html.escape(item.candidate.title)}</b>\n\n"
-            f"{html.escape(item.summary)}\n\n"
-            f"<b>Почему важно:</b> {html.escape(item.importance)}\n\n"
+        sections.append(
+            f"{flag} <b>{index}. {html.escape(_clip_text(item.candidate.title, 240))}</b>\n\n"
+            f"{html.escape(_clip_text(item.summary, 1200))}\n\n"
+            f"<b>Почему важно:</b> {html.escape(_clip_text(item.importance, 600))}\n\n"
             f'🔗 <a href="{html.escape(item.candidate.url, quote=True)}">'
-            f"{html.escape(item.candidate.source)}</a> · {local_time}"
+            f"{html.escape(_clip_text(item.candidate.source, 120))}</a> · {local_time}"
         )
+    closing = []
     if overview:
-        parts.append(f"<b>Коротко о главном:</b> {html.escape(overview)}")
-    parts.append("Хорошей и успешной недели! 🚀")
-    return "\n\n".join(parts)
+        closing.append(
+            f"<b>Коротко о главном:</b> "
+            f"{html.escape(_clip_text(overview, 600))}"
+        )
+    closing.append("Хорошей и успешной недели! 🚀")
+    sections.append("\n\n".join(closing))
+    return DIGEST_SECTION_SEPARATOR.join(sections)
 
 
 async def rank_and_summarize(
@@ -231,13 +275,16 @@ async def rank_and_summarize(
 
     for attempt in range(2):
         try:
-            response = await gemini_client.aio.models.generate_content(
-                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-                contents=prompt,
-                config={"temperature": 0.1, "max_output_tokens": 1800},
+            response = await asyncio.wait_for(
+                gemini_client.aio.models.generate_content(
+                    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                    contents=prompt,
+                    config={"temperature": 0.1, "max_output_tokens": 1800},
+                ),
+                timeout=float(os.getenv("NEWS_AI_TIMEOUT_SECONDS", "30")),
             )
             return parse_ranked_items(response.text or "{}", candidates)
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        except Exception as exc:
             logger.warning(
                 "[weekly_digest] Ошибка ранжирования, попытка %s: %s",
                 attempt + 1,
@@ -253,7 +300,7 @@ def _host_allowed(url: str, domains: tuple[str, ...]) -> bool:
     return any(host == domain or host.endswith(f".{domain}") for domain in domains)
 
 
-def _url_reachable(url: str) -> bool:
+def _inspect_source_page(url: str) -> dict | None:
     try:
         response = requests.get(
             url,
@@ -262,10 +309,46 @@ def _url_reachable(url: str) -> bool:
             stream=True,
             allow_redirects=True,
         )
-        response.close()
-        return response.status_code < 400
+        response.raise_for_status()
     except requests.RequestException:
-        return False
+        return None
+
+    final_url = _canonical_url(response.url)
+    soup = BeautifulSoup(response.text, "html.parser")
+    title_node = (
+        soup.select_one('meta[property="og:title"][content]')
+        or soup.select_one("h1")
+        or soup.select_one("title")
+    )
+    if title_node is None:
+        return None
+    title = (
+        title_node.get("content", "")
+        if title_node.name == "meta"
+        else title_node.get_text(" ", strip=True)
+    )
+    date_node = (
+        soup.select_one('meta[property="article:published_time"][content]')
+        or soup.select_one('meta[name="date"][content]')
+        or soup.select_one('meta[itemprop="datePublished"][content]')
+        or soup.select_one("time[datetime]")
+        or soup.select_one("time")
+    )
+    if date_node is None:
+        return None
+    published = date_node.get("content") or date_node.get("datetime") or date_node.get_text(
+        " ", strip=True
+    )
+    content = soup.select_one("article") or soup.select_one("main") or soup.body
+    text = content.get_text(" ", strip=True) if content else ""
+    if not final_url or not title.strip() or not published.strip() or len(text) < 40:
+        return None
+    return {
+        "final_url": final_url,
+        "title": title.strip(),
+        "text": text,
+        "date": published.strip(),
+    }
 
 
 async def search_additional_news(
@@ -306,22 +389,27 @@ async def search_additional_news(
         "Верни только JSON-массив объектов с полями title, text, url, source, "
         "date и is_world. Не включай материал без точной даты и прямого URL."
     )
-    checker = url_checker or _url_reachable
+    checker = url_checker or _inspect_source_page
 
     for attempt in range(2):
         try:
-            response = await client.aio.models.generate_content(
-                model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-                contents=prompt,
-                config={
-                    "temperature": 0.0,
-                    "max_output_tokens": 3000,
-                    "tools": [{"google_search": {}}],
-                },
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                    contents=prompt,
+                    config={
+                        "temperature": 0.0,
+                        "max_output_tokens": 3000,
+                        "tools": [{"google_search": {}}],
+                    },
+                ),
+                timeout=float(os.getenv("NEWS_AI_TIMEOUT_SECONDS", "30")),
             )
             raw_items = json.loads(_clean_json_payload(response.text or "[]"))
-            if not isinstance(raw_items, list):
-                return []
+            if not isinstance(raw_items, list) or any(
+                not isinstance(item, dict) for item in raw_items
+            ):
+                raise ValueError("Gemini search response must be a JSON array of objects")
 
             async def verify(raw: dict) -> dict | None:
                 url = _canonical_url(str(raw.get("url", "")))
@@ -332,19 +420,34 @@ async def search_additional_news(
                 )
                 if not url or not allowed:
                     return None
-                if not await asyncio.to_thread(checker, url):
+                page = await asyncio.to_thread(checker, url)
+                if not isinstance(page, dict):
+                    return None
+                final_url = _canonical_url(str(page.get("final_url", "")))
+                if not final_url or not _host_allowed(
+                    final_url,
+                    world_domains if is_world else local_domains,
+                ):
+                    return None
+                verified_title = str(page.get("title", "")).strip()
+                verified_text = str(page.get("text", "")).strip()
+                verified_date = str(page.get("date", "")).strip()
+                if not verified_title or not verified_text or not _parse_date(verified_date):
                     return None
                 verified = dict(raw)
-                verified["url"] = url
-                verified["article_id"] = str(raw.get("article_id") or url)
+                verified["url"] = final_url
+                verified["title"] = verified_title
+                verified["text"] = verified_text
+                verified["date"] = verified_date
+                verified["article_id"] = str(raw.get("article_id") or final_url)
                 verified["is_world"] = is_world
                 return verified
 
             checked = await asyncio.gather(
-                *(verify(item) for item in raw_items[:20] if isinstance(item, dict))
+                *(verify(item) for item in raw_items[:20])
             )
             return [item for item in checked if item is not None]
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        except Exception as exc:
             logger.warning(
                 "[weekly_digest] Ошибка резервного поиска, попытка %s: %s",
                 attempt + 1,
@@ -358,13 +461,18 @@ async def search_additional_news(
 def split_digest(text: str, limit: int = 3900) -> list[str]:
     if limit <= 0:
         raise ValueError("limit must be positive")
-    blocks = text.split("\n\n")
+    separator = (
+        DIGEST_SECTION_SEPARATOR
+        if DIGEST_SECTION_SEPARATOR in text
+        else "\n\n"
+    )
+    blocks = text.split(separator)
     chunks: list[str] = []
     current = ""
     for block in blocks:
         if len(block) > limit:
             raise ValueError("A digest block exceeds the Telegram message limit")
-        candidate = f"{current}\n\n{block}" if current else block
+        candidate = f"{current}{separator}{block}" if current else block
         if len(candidate) <= limit:
             current = candidate
         else:
@@ -392,7 +500,7 @@ async def build_digest(
 
     primary = await fetcher()
     candidates = normalize_candidates(primary, current)
-    if len(candidates) < 5:
+    if len(candidates) < 10 or not any(item.is_world for item in candidates):
         additional = await fallback(current)
         candidates = normalize_candidates(primary + additional, current)
     if not candidates:
@@ -413,31 +521,59 @@ async def publish_digest(
     publication_key: str,
     test_mode: bool = False,
     builder=None,
-    already_published=None,
+    claimer=None,
     recorder=None,
+    releaser=None,
+    failure_recorder=None,
+    chunk_limit: int = 3900,
 ) -> bool:
-    if already_published is None:
-        from bot.rag.firebase_db import was_digest_published
-
-        already_published = was_digest_published
-
-    if not test_mode and already_published(publication_key):
-        return False
-
-    build = builder or build_digest
-    text, article_ids = await build()
-    for chunk in split_digest(text):
-        await bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread_id,
-            text=chunk,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+    claimed = False
+    sent_chunks = 0
+    attempted_chunks = 0
     if not test_mode:
-        if recorder is None:
-            from bot.rag.firebase_db import mark_digest_published
+        if claimer is None:
+            from bot.rag.firebase_db import claim_digest_publication
 
-            recorder = mark_digest_published
-        recorder(publication_key, article_ids)
-    return True
+            claimer = claim_digest_publication
+        if not claimer(publication_key):
+            return False
+        claimed = True
+
+    try:
+        build = builder or build_digest
+        text, article_ids = await build()
+        for chunk in split_digest(text, limit=chunk_limit):
+            attempted_chunks += 1
+            await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            sent_chunks += 1
+        if claimed:
+            if recorder is None:
+                from bot.rag.firebase_db import mark_digest_published
+
+                recorder = mark_digest_published
+            recorder(publication_key, article_ids)
+        return True
+    except Exception:
+        if claimed and attempted_chunks == 0:
+            if releaser is None:
+                from bot.rag.firebase_db import release_digest_claim
+
+                releaser = release_digest_claim
+            releaser(publication_key)
+        elif claimed and attempted_chunks > 0:
+            if failure_recorder is None:
+                from bot.rag.firebase_db import mark_digest_partial_failure
+
+                failure_recorder = mark_digest_partial_failure
+            failure_recorder(
+                publication_key,
+                sent_chunks,
+                attempted_chunks > sent_chunks,
+            )
+        raise

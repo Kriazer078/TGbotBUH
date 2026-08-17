@@ -6,6 +6,7 @@ from bot.services.news_digest_service import (
     DigestItem,
     NewsCandidate,
     build_digest,
+    digest_schedule,
     format_digest,
     normalize_candidates,
     parse_ranked_items,
@@ -83,6 +84,61 @@ class NormalizeCandidatesTests(unittest.TestCase):
 
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0].article_id, "b")
+
+    def test_treats_source_date_without_timezone_as_almaty_time(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        raw = [
+            {
+                "article_id": "edge",
+                "title": "Новость на границе",
+                "text": "Описание",
+                "url": "https://stat.gov.kz/news/edge",
+                "source": "БНС",
+                "date": "2026-08-16 08:30",
+            },
+            {
+                "article_id": "old",
+                "title": "Новость старше суток",
+                "text": "Описание",
+                "url": "https://stat.gov.kz/news/old",
+                "source": "БНС",
+                "date": "2026-08-16 08:29",
+            },
+        ]
+
+        result = normalize_candidates(raw, now=now)
+
+        self.assertEqual([item.article_id for item in result], ["edge"])
+
+    def test_rejects_date_without_publication_time(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        raw = [{
+            "article_id": "date-only",
+            "title": "Новость без точного времени",
+            "text": "Описание",
+            "url": "https://stat.gov.kz/news/date-only",
+            "source": "БНС",
+            "date": "2026-08-17",
+        }]
+
+        result = normalize_candidates(raw, now=now)
+
+        self.assertEqual(result, [])
+
+    def test_rejects_publication_time_without_calendar_date(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        raw = [{
+            "article_id": "time-only",
+            "title": "Новость без даты",
+            "text": "Описание",
+            "url": "https://stat.gov.kz/news/time-only",
+            "source": "БНС",
+            "date": "08:00",
+        }]
+
+        result = normalize_candidates(raw, now=now)
+
+        self.assertEqual(result, [])
 
 
 class DigestFormattingTests(unittest.TestCase):
@@ -211,6 +267,97 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0].candidate.article_id, "1")
         self.assertIn("Финансовые условия", overview)
 
+    async def test_retries_when_gemini_returns_wrong_json_shape(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        candidate = NewsCandidate(
+            "1",
+            "Решение НБК",
+            "Подробности",
+            "https://nationalbank.kz/news/1",
+            "НБК",
+            now,
+        )
+
+        class FakeModels:
+            def __init__(self):
+                self.calls = 0
+
+            async def generate_content(self, **kwargs):
+                self.calls += 1
+                payload = [] if self.calls == 1 else {
+                    "items": [
+                        {
+                            "url": candidate.url,
+                            "summary": "Сводка.",
+                            "importance": "Важно.",
+                        }
+                    ],
+                    "overview": "Вывод.",
+                }
+                return type(
+                    "Response",
+                    (),
+                    {"text": json.dumps(payload, ensure_ascii=False)},
+                )()
+
+        models = FakeModels()
+        fake_client = type(
+            "Client",
+            (),
+            {"aio": type("Aio", (), {"models": models})()},
+        )()
+
+        items, _ = await rank_and_summarize([candidate], client=fake_client)
+
+        self.assertEqual(models.calls, 2)
+        self.assertEqual(items[0].candidate.article_id, "1")
+
+    async def test_retries_after_gemini_transport_error(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        candidate = NewsCandidate(
+            "1",
+            "Решение НБК",
+            "Подробности",
+            "https://nationalbank.kz/news/1",
+            "НБК",
+            now,
+        )
+
+        class FakeModels:
+            def __init__(self):
+                self.calls = 0
+
+            async def generate_content(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary network failure")
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "text": json.dumps({
+                            "items": [{
+                                "url": candidate.url,
+                                "summary": "Сводка.",
+                                "importance": "Важно.",
+                            }],
+                            "overview": "Вывод.",
+                        }, ensure_ascii=False)
+                    },
+                )()
+
+        models = FakeModels()
+        fake_client = type(
+            "Client",
+            (),
+            {"aio": type("Aio", (), {"models": models})()},
+        )()
+
+        items, _ = await rank_and_summarize([candidate], client=fake_client)
+
+        self.assertEqual(models.calls, 2)
+        self.assertEqual(items[0].candidate.article_id, "1")
+
 
 class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_uses_fallback_when_primary_has_fewer_than_five(self):
@@ -259,6 +406,58 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(article_ids, ["1"])
         self.assertIn("Новость 1", text)
 
+    async def test_build_supplements_local_only_primary_candidates(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        titles = [
+            "НБК сообщил о базовой ставке",
+            "Экспорт Казахстана вырос за месяц",
+            "Опубликованы данные по инфляции",
+            "Банки изменили условия кредитования",
+            "Предприниматели открыли новые производства",
+        ]
+        primary = [
+            {
+                "article_id": str(index),
+                "title": titles[index - 1],
+                "text": "Подробности",
+                "url": f"https://example.kz/{index}",
+                "source": "Источник",
+                "date": "2026-08-17T01:00:00Z",
+                "is_world": False,
+            }
+            for index in range(1, 6)
+        ]
+        fallback_calls = []
+
+        async def fallback_search(_now):
+            fallback_calls.append(True)
+            return [
+                {
+                    "article_id": "world",
+                    "title": "Мировая новость",
+                    "text": "Подробности",
+                    "url": "https://reuters.com/world/1",
+                    "source": "Reuters",
+                    "date": "2026-08-17T01:00:00Z",
+                    "is_world": True,
+                }
+            ]
+
+        async def fetcher():
+            return primary
+
+        async def ranker(candidates):
+            return [DigestItem(candidates[0], "Сводка.", "Важно.")], "Вывод."
+
+        await build_digest(
+            now=now,
+            fetcher=fetcher,
+            fallback_search=fallback_search,
+            ranker=ranker,
+        )
+
+        self.assertEqual(fallback_calls, [True])
+
     async def test_publish_sends_to_topic_and_records_success(self):
         sent_messages = []
         recorded = []
@@ -276,7 +475,7 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             thread_id=1,
             publication_key="2026-08-17",
             builder=builder,
-            already_published=lambda _key: False,
+            claimer=lambda _key: True,
             recorder=lambda key, ids: recorded.append((key, ids)),
         )
 
@@ -295,10 +494,91 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             chat_id=-1002318310296,
             thread_id=1,
             publication_key="2026-08-17",
-            already_published=lambda _key: True,
+            claimer=lambda _key: False,
         )
 
         self.assertFalse(result)
+
+    async def test_publish_releases_claim_when_build_fails(self):
+        released = []
+
+        async def failing_builder():
+            raise RuntimeError("build failed")
+
+        with self.assertRaisesRegex(RuntimeError, "build failed"):
+            await publish_digest(
+                object(),
+                chat_id=-1002318310296,
+                thread_id=1,
+                publication_key="2026-08-17",
+                builder=failing_builder,
+                claimer=lambda _key: True,
+                releaser=lambda key: released.append(key),
+            )
+
+        self.assertEqual(released, ["2026-08-17"])
+
+    async def test_publish_keeps_claim_after_partial_send_failure(self):
+        released = []
+        failures = []
+
+        class FailingBot:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_message(self, **kwargs):
+                self.calls += 1
+                if self.calls == 2:
+                    raise RuntimeError("telegram failed")
+
+        async def builder():
+            return "Первая часть\n\n──────────\n\nВторая часть", ["1"]
+
+        with self.assertRaisesRegex(RuntimeError, "telegram failed"):
+            await publish_digest(
+                FailingBot(),
+                chat_id=-1002318310296,
+                thread_id=1,
+                publication_key="2026-08-17",
+                builder=builder,
+                claimer=lambda _key: True,
+                releaser=lambda key: released.append(key),
+                failure_recorder=lambda key, count, ambiguous: failures.append(
+                    (key, count, ambiguous)
+                ),
+                chunk_limit=20,
+            )
+
+        self.assertEqual(released, [])
+        self.assertEqual(failures, [("2026-08-17", 1, True)])
+
+    async def test_publish_keeps_claim_when_first_send_has_ambiguous_error(self):
+        released = []
+        failures = []
+
+        class AmbiguousBot:
+            async def send_message(self, **kwargs):
+                raise TimeoutError("Telegram response timed out")
+
+        async def builder():
+            return "Одна часть", ["1"]
+
+        with self.assertRaises(TimeoutError):
+            await publish_digest(
+                AmbiguousBot(),
+                chat_id=-1002318310296,
+                thread_id=1,
+                publication_key="2026-08-17",
+                builder=builder,
+                claimer=lambda _key: True,
+                releaser=lambda key: released.append(key),
+                failure_recorder=lambda key, count, ambiguous: failures.append(
+                    (key, count, ambiguous)
+                ),
+            )
+
+        self.assertEqual(released, [])
+        self.assertEqual(failures, [("2026-08-17", 0, True)])
 
     async def test_fallback_accepts_allowed_local_and_world_sources(self):
         now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
@@ -343,16 +623,149 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
             {"aio": type("Aio", (), {"models": FakeModels()})()},
         )()
 
+        verified_pages = {
+            "https://nationalbank.kz/news/1": {
+                "final_url": "https://nationalbank.kz/news/1",
+                "title": "Подтверждённая новость НБК",
+                "text": "На странице опубликовано подробное описание решения.",
+                "date": "2026-08-17T01:05:00Z",
+            },
+            "https://reuters.com/world/3": {
+                "final_url": "https://reuters.com/world/3",
+                "title": "Подтверждённая мировая новость",
+                "text": "На странице опубликовано подробное описание события.",
+                "date": "2026-08-17T01:10:00Z",
+            },
+        }
+
         result = await search_additional_news(
             now,
             client=fake_client,
-            url_checker=lambda _url: True,
+            url_checker=lambda url: verified_pages.get(url),
         )
 
         self.assertEqual(
             [item["title"] for item in result],
-            ["Новость НБК", "Мировая новость"],
+            ["Подтверждённая новость НБК", "Подтверждённая мировая новость"],
         )
+        self.assertEqual(result[0]["date"], "2026-08-17T01:05:00Z")
+
+    async def test_fallback_rejects_redirect_outside_allowed_domains(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        payload = [{
+            "title": "Подозрительная новость",
+            "text": "Подробности",
+            "url": "https://nationalbank.kz/redirect",
+            "source": "НБК",
+            "date": "2026-08-17T01:00:00Z",
+            "is_world": False,
+        }]
+
+        class FakeModels:
+            async def generate_content(self, **kwargs):
+                return type("Response", (), {"text": json.dumps(payload)})()
+
+        fake_client = type(
+            "Client",
+            (),
+            {"aio": type("Aio", (), {"models": FakeModels()})()},
+        )()
+
+        result = await search_additional_news(
+            now,
+            client=fake_client,
+            url_checker=lambda _url: {
+                "final_url": "https://evil.example/fake",
+                "title": "Чужая страница",
+                "text": "Чужой текст",
+                "date": "2026-08-17T01:00:00Z",
+            },
+        )
+
+        self.assertEqual(result, [])
+
+    async def test_fallback_retries_transport_error(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        payload = [{
+            "title": "Новость НБК",
+            "text": "Подробности",
+            "url": "https://nationalbank.kz/news/retry",
+            "source": "НБК",
+            "date": "2026-08-17T01:00:00Z",
+            "is_world": False,
+        }]
+
+        class FakeModels:
+            def __init__(self):
+                self.calls = 0
+
+            async def generate_content(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary search failure")
+                return type("Response", (), {"text": json.dumps(payload)})()
+
+        models = FakeModels()
+        fake_client = type(
+            "Client",
+            (),
+            {"aio": type("Aio", (), {"models": models})()},
+        )()
+
+        result = await search_additional_news(
+            now,
+            client=fake_client,
+            url_checker=lambda url: {
+                "final_url": url,
+                "title": "Подтверждённая новость",
+                "text": "Подтверждённый подробный текст публикации.",
+                "date": "2026-08-17T01:00:00Z",
+            },
+        )
+
+        self.assertEqual(models.calls, 2)
+        self.assertEqual(result[0]["title"], "Подтверждённая новость")
+
+    async def test_fallback_retries_wrong_json_shape(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        valid_payload = [{
+            "title": "Новость НБК",
+            "text": "Подробности",
+            "url": "https://nationalbank.kz/news/shape",
+            "source": "НБК",
+            "date": "2026-08-17T01:00:00Z",
+            "is_world": False,
+        }]
+
+        class FakeModels:
+            def __init__(self):
+                self.calls = 0
+
+            async def generate_content(self, **kwargs):
+                self.calls += 1
+                payload = {} if self.calls == 1 else valid_payload
+                return type("Response", (), {"text": json.dumps(payload)})()
+
+        models = FakeModels()
+        fake_client = type(
+            "Client",
+            (),
+            {"aio": type("Aio", (), {"models": models})()},
+        )()
+
+        result = await search_additional_news(
+            now,
+            client=fake_client,
+            url_checker=lambda url: {
+                "final_url": url,
+                "title": "Подтверждённая новость",
+                "text": "Подтверждённый подробный текст публикации.",
+                "date": "2026-08-17T01:00:00Z",
+            },
+        )
+
+        self.assertEqual(models.calls, 2)
+        self.assertEqual(len(result), 1)
 
     def test_split_digest_keeps_chunks_below_limit(self):
         text = "Блок один\n\nБлок два\n\nБлок три"
@@ -361,6 +774,52 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("\n\n".join(chunks), text)
         self.assertTrue(all(len(chunk) <= 20 for chunk in chunks))
+
+    def test_format_limits_unexpectedly_long_ai_text(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        candidate = NewsCandidate(
+            "long",
+            "Очень длинный заголовок " * 100,
+            "Исходный текст",
+            "https://example.com/long",
+            "Источник",
+            now,
+        )
+        item = DigestItem(candidate, "Сводка " * 1000, "Важно " * 1000)
+
+        text = format_digest([item], "Вывод " * 1000, greeting="Доброе утро")
+        chunks = split_digest(text)
+
+        self.assertTrue(all(len(chunk) <= 3900 for chunk in chunks))
+
+    def test_split_digest_keeps_each_news_item_with_its_source(self):
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        items = [
+            DigestItem(
+                NewsCandidate(
+                    str(index),
+                    f"Уникальный заголовок {index}",
+                    "Исходный текст",
+                    f"https://example.com/{index}",
+                    f"Источник {index}",
+                    now,
+                ),
+                f"Описание {index} " * 25,
+                f"Значение {index} " * 10,
+            )
+            for index in (1, 2)
+        ]
+
+        chunks = split_digest(
+            format_digest(items, "Общий вывод", greeting="Доброе утро"),
+            limit=700,
+        )
+
+        for index in (1, 2):
+            item_chunk = next(
+                chunk for chunk in chunks if f"Уникальный заголовок {index}" in chunk
+            )
+            self.assertIn(f"Источник {index}", item_chunk)
 
 
 class DigestPersistenceTests(unittest.TestCase):
@@ -408,6 +867,164 @@ class DigestPersistenceTests(unittest.TestCase):
         self.assertEqual(fake_db.name, "news_digest_publications")
         self.assertEqual(saved["article_ids"], ["a", "b"])
         self.assertIn("published_at", saved)
+        self.assertEqual(saved["status"], "published")
+
+    def test_claim_uses_atomic_document_create(self):
+        from bot.rag.firebase_db import claim_digest_publication
+
+        created = []
+
+        class FakeDocument:
+            def create(self, data):
+                created.append(data)
+
+        class FakeCollection:
+            def document(self, _key):
+                return FakeDocument()
+
+        class FakeDb:
+            def collection(self, _name):
+                return FakeCollection()
+
+        self.firebase_db.db = FakeDb()
+
+        claimed = claim_digest_publication("2026-08-17")
+
+        self.assertTrue(claimed)
+        self.assertEqual(created[0]["status"], "publishing")
+
+    def test_claim_returns_false_when_document_already_exists(self):
+        from google.api_core.exceptions import AlreadyExists
+        from bot.rag.firebase_db import claim_digest_publication
+
+        class FakeDocument:
+            def create(self, _data):
+                raise AlreadyExists("already claimed")
+
+            def get(self):
+                return type(
+                    "Snapshot",
+                    (),
+                    {"to_dict": lambda _self: {"status": "published"}},
+                )()
+
+        class FakeCollection:
+            def document(self, _key):
+                return FakeDocument()
+
+        class FakeDb:
+            def collection(self, _name):
+                return FakeCollection()
+
+        self.firebase_db.db = FakeDb()
+
+        self.assertFalse(claim_digest_publication("2026-08-17"))
+
+    def test_release_deletes_unused_claim(self):
+        from bot.rag.firebase_db import release_digest_claim
+
+        deleted = []
+
+        class FakeDocument:
+            def delete(self):
+                deleted.append(True)
+
+        class FakeCollection:
+            def document(self, _key):
+                return FakeDocument()
+
+        class FakeDb:
+            def collection(self, _name):
+                return FakeCollection()
+
+        self.firebase_db.db = FakeDb()
+
+        release_digest_claim("2026-08-17")
+
+        self.assertEqual(deleted, [True])
+
+    def test_stale_claim_can_be_reclaimed_atomically(self):
+        from datetime import timedelta
+
+        from bot.rag.firebase_db import _try_reclaim_digest_claim
+
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+        updates = []
+
+        class FakeSnapshot:
+            def to_dict(self):
+                return {
+                    "status": "publishing",
+                    "lease_until": now - timedelta(minutes=1),
+                }
+
+        class FakeDocument:
+            def get(self, transaction=None):
+                return FakeSnapshot()
+
+        class FakeTransaction:
+            def update(self, _doc, data):
+                updates.append(data)
+
+        reclaimed = _try_reclaim_digest_claim(
+            FakeTransaction(),
+            FakeDocument(),
+            now,
+            now + timedelta(minutes=30),
+        )
+
+        self.assertTrue(reclaimed)
+        self.assertEqual(updates[0]["status"], "publishing")
+
+    def test_active_claim_is_not_reclaimed(self):
+        from datetime import timedelta
+
+        from bot.rag.firebase_db import _try_reclaim_digest_claim
+
+        now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
+
+        class FakeSnapshot:
+            def to_dict(self):
+                return {
+                    "status": "publishing",
+                    "lease_until": now + timedelta(minutes=1),
+                }
+
+        class FakeDocument:
+            def get(self, transaction=None):
+                return FakeSnapshot()
+
+        class FakeTransaction:
+            def update(self, _doc, _data):
+                raise AssertionError("Active claim must not be updated")
+
+        reclaimed = _try_reclaim_digest_claim(
+            FakeTransaction(),
+            FakeDocument(),
+            now,
+            now + timedelta(minutes=30),
+        )
+
+        self.assertFalse(reclaimed)
+
+
+class DigestScheduleTests(unittest.TestCase):
+    def test_default_schedule_is_monday_0930_almaty(self):
+        schedule = digest_schedule({})
+
+        self.assertEqual(
+            schedule,
+            {
+                "day_of_week": "mon",
+                "hour": 9,
+                "minute": 30,
+                "timezone": "Asia/Almaty",
+            },
+        )
+
+    def test_rejects_invalid_time(self):
+        with self.assertRaisesRegex(ValueError, "HH:MM"):
+            digest_schedule({"NEWS_SCHEDULE_TIME": "25:70"})
 
 
 if __name__ == "__main__":

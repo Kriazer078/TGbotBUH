@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
 import numpy as np
@@ -198,7 +198,8 @@ def get_recent_news(limit: int = 5) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def save_dialog(user_id: int, user_text: str, bot_answer: str,
-                thread_id: int = None, embedding: list = None) -> str | None:
+                thread_id: int = None, embedding: list = None,
+                doc_id: str = None) -> str | None:
     """
     Сохраняет пару вопрос-ответ в коллекцию 'dialogs'.
     Возвращает doc_id для последующей оценки.
@@ -206,7 +207,8 @@ def save_dialog(user_id: int, user_text: str, bot_answer: str,
     if not db:
         return None
     try:
-        doc_id = f"dlg_{uuid.uuid4().hex[:12]}"
+        if doc_id is None:
+            doc_id = f"dlg_{uuid.uuid4().hex[:12]}"
         data = {
             "user_id":   user_id,
             "thread_id": thread_id,
@@ -393,3 +395,124 @@ def delete_user_task(task_id: str) -> bool:
     except Exception as e:
         logger.error(f"[tasks] Ошибка завершения задачи: {e}")
         return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ПОНЕДЕЛЬНИЧНАЯ ПОДБОРКА НОВОСТЕЙ
+# ══════════════════════════════════════════════════════════════════════════════
+
+def was_digest_published(publication_key: str) -> bool:
+    """Проверяет, публиковалась ли уже подборка с указанным ключом."""
+    if not db:
+        raise RuntimeError(
+            "Firebase недоступна: нельзя безопасно проверить повторную публикацию"
+        )
+    return (
+        db.collection("news_digest_publications")
+        .document(publication_key)
+        .get()
+        .exists
+    )
+
+
+def _try_reclaim_digest_claim(
+    transaction,
+    doc_ref,
+    now: datetime,
+    lease_until: datetime,
+) -> bool:
+    """В транзакции заменяет только истёкший резерв публикации."""
+    snapshot = doc_ref.get(transaction=transaction)
+    data = snapshot.to_dict() or {}
+    current_lease = data.get("lease_until")
+    if (
+        data.get("status") != "publishing"
+        or not isinstance(current_lease, datetime)
+        or current_lease > now
+    ):
+        return False
+    transaction.update(doc_ref, {
+        "status": "publishing",
+        "claimed_at": firestore.SERVER_TIMESTAMP,
+        "lease_until": lease_until,
+    })
+    return True
+
+
+def claim_digest_publication(publication_key: str) -> bool:
+    """Атомарно резервирует дату публикации; False означает, что она занята."""
+    if not db:
+        raise RuntimeError(
+            "Firebase недоступна: нельзя безопасно зарезервировать публикацию"
+        )
+    from google.api_core.exceptions import AlreadyExists
+
+    doc_ref = db.collection("news_digest_publications").document(publication_key)
+    now = datetime.now(timezone.utc)
+    lease_until = now + timedelta(
+        minutes=int(os.getenv("NEWS_CLAIM_LEASE_MINUTES", "30"))
+    )
+    try:
+        doc_ref.create({
+            "status": "publishing",
+            "claimed_at": firestore.SERVER_TIMESTAMP,
+            "lease_until": lease_until,
+        })
+        return True
+    except AlreadyExists:
+        snapshot = doc_ref.get()
+        data = snapshot.to_dict() or {}
+        current_lease = data.get("lease_until")
+        if (
+            data.get("status") != "publishing"
+            or not isinstance(current_lease, datetime)
+            or current_lease > now
+        ):
+            return False
+
+        @firestore.transactional
+        def reclaim(transaction):
+            return _try_reclaim_digest_claim(
+                transaction,
+                doc_ref,
+                now,
+                lease_until,
+            )
+
+        return reclaim(db.transaction())
+
+
+def release_digest_claim(publication_key: str) -> None:
+    """Освобождает резерв, если публикация не успела отправить сообщения."""
+    if not db:
+        raise RuntimeError("Firebase недоступна: нельзя освободить резерв")
+    db.collection("news_digest_publications").document(publication_key).delete()
+
+
+def mark_digest_partial_failure(
+    publication_key: str,
+    sent_chunks: int,
+    ambiguous: bool,
+) -> None:
+    """Сохраняет частичный сбой и оставляет резерв для защиты от дублей."""
+    if not db:
+        raise RuntimeError("Firebase недоступна: нельзя записать частичный сбой")
+    db.collection("news_digest_publications").document(publication_key).update({
+        "status": "partial_failure",
+        "sent_chunks": sent_chunks,
+        "ambiguous": ambiguous,
+        "failed_at": firestore.SERVER_TIMESTAMP,
+    })
+
+
+def mark_digest_published(publication_key: str, article_ids: list[str]) -> None:
+    """Запоминает успешную публикацию и использованные материалы."""
+    if not db:
+        raise RuntimeError(
+            "Firebase недоступна: нельзя записать успешную публикацию"
+        )
+    db.collection("news_digest_publications").document(publication_key).set({
+        "status": "published",
+        "article_ids": article_ids,
+        "published_at": firestore.SERVER_TIMESTAMP,
+    })

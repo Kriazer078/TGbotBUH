@@ -1,7 +1,10 @@
 import os
 import re
+import uuid
+import time
 import asyncio
 import logging
+from collections import OrderedDict
 from datetime import datetime
 
 from google import genai
@@ -44,6 +47,8 @@ RATES_2026 = {
     # Прочие налоги
     "НДС":             0.16,    # 16%
     "КПН":             0.20,    # 20%
+    # Базовая ставка НБРК (для расчёта пеней)
+    "БАЗОВАЯ_СТАВКА":  0.1525,  # 15.25% — базовая ставка НБРК на 2026
 }
 
 # ── Системная инструкция ───────────────────────────────────────────────────────
@@ -99,6 +104,72 @@ adilet.zan.kz | kgd.gov.kz | minfin.gov.kz | egov.kz | enbek.gov.kz
 # ── История по темам ───────────────────────────────────────────────────────────
 thread_histories: dict[int, list] = {}
 MAX_HISTORY = 20
+
+# ── Кэш системного промпта (обновляется раз в сутки) ──────────────────────────
+_cached_system: tuple[str, str] = ("", "")
+
+def _get_system_prompt() -> str:
+    today = datetime.now().strftime("%d.%m.%Y")
+    if _cached_system[0] == today:
+        return _cached_system[1]
+    text = _SYSTEM_INSTRUCTION.format(today=today)
+    globals()['_cached_system'] = (today, text)
+    return text
+
+# ── TTL-кэш ответов (200 вопросов, TTL 1 час) ─────────────────────────────────
+class _TTLCache:
+    def __init__(self, maxsize: int = 200, ttl: int = 3600):
+        self._cache: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+        self._ttl = ttl
+
+    def get(self, key: str):
+        if key in self._cache:
+            value, ts = self._cache[key]
+            if time.time() - ts < self._ttl:
+                self._cache.move_to_end(key)
+                return value
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, value):
+        self._cache[key] = (value, time.time())
+        self._cache.move_to_end(key)
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+_response_cache = _TTLCache(maxsize=200, ttl=3600)
+
+# ── Определение: нужен ли Google Search ───────────────────────────────────────
+_LOCAL_KEYWORDS = {
+    "мзп", "мрп", "ндс", "ипн", "опв", "кпн", "со ", "осмс", "восмс",
+    "ставка", "ставки", "вычет", "амортизац", "зарплат", " зп ", "оклад",
+    "что такое", "как рассчит", "формул", "коэффициент", "расчёт", "расчет",
+}
+
+def _needs_search(text: str) -> bool:
+    """Возвращает False для вопросов, которые решаются без интернета."""
+    t = text.lower()
+    if len(text) < 200 and any(k in t for k in _LOCAL_KEYWORDS):
+        return False
+    return True
+
+# ── Сборка RAG-контекста ──────────────────────────────────────────────────────
+def _build_context(rag_articles, similar_dialogs, news) -> str:
+    context = ""
+    if isinstance(rag_articles, list) and rag_articles:
+        context += "\n[БАЗА ЗНАНИЙ]:\n"
+        for art in rag_articles:
+            context += f"- {art['title']}: {art['text'][:600]}\n"
+    if isinstance(similar_dialogs, list) and similar_dialogs:
+        context += "\n[ПРОШЛЫЙ ОПЫТ]:\n"
+        for dlg in similar_dialogs:
+            context += f"Q: {dlg['question']}\nA: {dlg['answer'][:400]}\n"
+    if isinstance(news, list) and news:
+        context += "\n[НОВОСТИ]:\n"
+        for n in news:
+            context += f"- {n['title']}: {n['text'][:300]}\n"
+    return context
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ТРАНСКРИПЦИЯ ГОЛОСОВЫХ СООБЩЕНИЙ
@@ -207,26 +278,91 @@ def _calc_depreciation(cost: float, residual: float, years: int) -> str:
     )
 
 
+def _calc_penalty(debt: float, days: int) -> str:
+    """Пеня за просрочку налогов (НК РК 2026)."""
+    r = RATES_2026
+    # Пеня = долг × (базовая ставка НБРК × 1.25) × дней / 365
+    daily_rate = r["БАЗОВАЯ_СТАВКА"] * 1.25 / 365
+    penalty    = round(debt * daily_rate * days, 2)
+    annual_pct = round(r["БАЗОВАЯ_СТАВКА"] * 1.25 * 100, 4)
+    return (
+        f"<b>📊 Расчёт пени за просрочку</b>\n\n"
+        f"├ Сумма долга = <code>{debt:,.2f} тг</code>\n"
+        f"├ Дней просрочки = <code>{days}</code>\n"
+        f"├ Ставка = базовая НБРК ({r['БАЗОВАЯ_СТАВКА']*100:.2f}%) × 1.25 = <code>{annual_pct}%</code>\n"
+        f"└ <b>Пеня = <code>{penalty:,.2f} тг</code></b>\n\n"
+        f"<i>ст. 117 НК РК | Базовая ставка НБРК = {r['БАЗОВАЯ_СТАВКА']*100:.2f}%</i>"
+    )
+
+
+def _calc_vacation(monthly_salary: float, vacation_days: int,
+                   worked_months: int = 12) -> str:
+    """Отпускные (ТК РК): среднедневная ЗП × кол-во дней отпуска."""
+    # Среднедневная = средняя ЗП / 29.3 (среднее кол-во дней в месяце по ТК РК)
+    avg_daily = round(monthly_salary / 29.3, 2)
+    total     = round(avg_daily * vacation_days, 2)
+    return (
+        f"<b>📊 Расчёт отпускных</b>\n\n"
+        f"├ Среднемесячная ЗП = <code>{monthly_salary:,.2f} тг</code>\n"
+        f"├ Среднедневная ЗП = <code>{avg_daily:,.2f} тг</code>\n"
+        f"├ Дней отпуска = <code>{vacation_days}</code>\n"
+        f"└ <b>Отпускные = <code>{total:,.2f} тг</code></b>\n\n"
+        f"<i>ст. 92 ТК РК | Коэффициент 29.3 (среднее дней/мес)</i>"
+    )
+
+
+def _calc_sick_leave(monthly_salary: float, sick_days: int) -> str:
+    """Больничные (ВОСМС РК): 80% среднедневной ЗП × дней."""
+    avg_daily = round(monthly_salary / 29.3, 2)
+    pct       = 0.80
+    daily_pay = round(avg_daily * pct, 2)
+    total     = round(daily_pay * sick_days, 2)
+    return (
+        f"<b>📊 Расчёт больничных</b>\n\n"
+        f"├ Среднемесячная ЗП = <code>{monthly_salary:,.2f} тг</code>\n"
+        f"├ Среднедневная ЗП = <code>{avg_daily:,.2f} тг</code>\n"
+        f"├ Размер выплаты = <code>80%</code>\n"
+        f"├ Дней болезни = <code>{sick_days}</code>\n"
+        f"└ <b>Больничные = <code>{total:,.2f} тг</code></b>\n\n"
+        f"<i>Закон об ОСМС РК | Выплачивает ФСМС с 1-го дня</i>"
+    )
+
+
 def _parse_and_calculate(text: str) -> str | None:
     """Распознаёт тип расчёта и возвращает результат или None."""
     t = text.lower()
+    nums = [float(n.replace(',', '.')) for n in re.findall(r'\d+(?:[.,]\d+)?', text)]
 
     # ЗП
     if any(k in t for k in ["зп ", "зарплат", "оклад", "расчёт зп", "расчет зп"]):
-        nums = re.findall(r'\d+(?:[.,]\d+)?', text)
         if nums:
-            return _calc_salary(float(nums[0].replace(',', '.')))
+            return _calc_salary(nums[0])
 
     # НДС
     if "ндс" in t or "nds" in t:
-        nums = re.findall(r'\d+(?:[.,]\d+)?', text)
         if nums:
             with_nds = any(p in t for p in ["с ндс", "включая ндс", "в т.ч", "выдели"])
-            return _calc_nds(float(nums[0].replace(',', '.')), with_nds=with_nds)
+            return _calc_nds(nums[0], with_nds=with_nds)
+
+    # Пеня
+    if any(k in t for k in ["пен", "штраф за просроч", "просрочк"]):
+        if len(nums) >= 2:
+            return _calc_penalty(nums[0], int(nums[1]))
+
+    # Отпускные
+    if any(k in t for k in ["отпускн", "отпуск"]):
+        if len(nums) >= 2:
+            return _calc_vacation(nums[0], int(nums[1]))
+        if len(nums) == 1:
+            return _calc_vacation(nums[0], 24)  # 24 дня — стандартный отпуск по ТК РК
+
+    # Больничные
+    if any(k in t for k in ["больничн", "нетрудоспособ", "болезн"]):
+        if len(nums) >= 2:
+            return _calc_sick_leave(nums[0], int(nums[1]))
 
     # Амортизация
     if any(k in t for k in ["амортизац", "спи "]):
-        nums = [float(n.replace(',', '.')) for n in re.findall(r'\d+(?:[.,]\d+)?', text)]
         if len(nums) >= 3:
             return _calc_depreciation(nums[0], nums[1], int(nums[2]))
         if len(nums) == 2:
@@ -254,6 +390,125 @@ async def embed_text(text: str) -> list:
                 return []
             await asyncio.sleep(1)
     return []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# СТРИМИНГ ОТВЕТА
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def stream_ai_response(
+    user_text: str,
+    thread_id: int = None,
+    user_id: int = None,
+):
+    """
+    Async-генератор. Отдаёт куски текста по мере генерации Gemini.
+    Последний элемент — tuple ("done", full_answer, doc_id).
+    Если вопрос — калькулятор, отдаёт сразу tuple ("calc", result).
+    """
+    # Калькулятор — мгновенно, без AI
+    calc = _parse_and_calculate(user_text)
+    if calc:
+        yield ("calc", calc)
+        return
+
+    # Кэш — мгновенно для повторных вопросов
+    cache_key = user_text.lower().strip()
+    cached = _response_cache.get(cache_key)
+    if cached:
+        yield ("cached", cached[0], cached[1])
+        return
+
+    try:
+        # RAG: эмбеддинг + Firebase параллельно
+        query_embedding = await embed_text(user_text)
+        if query_embedding:
+            rag_articles, similar_dialogs, news = await asyncio.gather(
+                search_similar_articles(query_embedding, 2),
+                asyncio.to_thread(get_similar_dialogs, query_embedding, 1),
+                asyncio.to_thread(get_recent_news, 2),
+                return_exceptions=True,
+            )
+        else:
+            rag_articles, similar_dialogs, news = [], [], []
+
+        context = _build_context(rag_articles, similar_dialogs, news)
+        full_prompt = f"Контекст:\n{context}\n\nВОПРОС: {user_text}" if context else user_text
+
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        if model in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "text-embedding-004"]:
+            model = "gemini-2.5-flash"
+
+        tools = [genai_types.Tool(google_search=genai_types.GoogleSearch())] if _needs_search(user_text) else []
+        config = genai_types.GenerateContentConfig(
+            system_instruction=_get_system_prompt(),
+            temperature=0.1,
+            max_output_tokens=900,
+            tools=tools,
+        )
+
+        history = thread_histories.get(thread_id, []) if thread_id is not None else []
+        messages = history + [
+            genai_types.Content(role="user", parts=[genai_types.Part(text=full_prompt)])
+        ]
+
+        full_answer = ""
+        try:
+            async for chunk in _client.aio.models.generate_content_stream(
+                model=model, contents=messages, config=config
+            ):
+                try:
+                    text = chunk.text or ""
+                except Exception:
+                    text = ""
+                if text:
+                    full_answer += text
+                    yield text
+        except AttributeError:
+            # Fallback: синхронный вызов если aio недоступен
+            response = await asyncio.to_thread(
+                _client.models.generate_content,
+                model=model, contents=messages, config=config,
+            )
+            try:
+                full_answer = response.text or ""
+            except Exception:
+                parts = response.candidates[0].content.parts
+                full_answer = "".join(p.text for p in parts if hasattr(p, "text") and p.text)
+            yield full_answer
+
+        if not full_answer.strip():
+            yield ("done", "⚠️ Не удалось получить ответ. Переформулируйте вопрос.", None)
+            return
+
+        # Markdown → HTML
+        full_answer = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', full_answer)
+
+        # Обновляем историю темы
+        if thread_id is not None:
+            new_history = messages + [
+                genai_types.Content(role="model", parts=[genai_types.Part(text=full_answer)])
+            ]
+            thread_histories[thread_id] = new_history[-MAX_HISTORY:]
+
+        # Сохраняем диалог в фоне с заранее известным doc_id
+        doc_id = f"dlg_{uuid.uuid4().hex[:12]}"
+
+        async def _save():
+            await asyncio.to_thread(
+                save_dialog, user_id or 0, user_text, full_answer,
+                thread_id, query_embedding or None, doc_id,
+            )
+        asyncio.create_task(_save())
+
+        # Кэшируем ответ
+        _response_cache.set(cache_key, (full_answer, doc_id))
+
+        yield ("done", full_answer, doc_id)
+
+    except Exception as e:
+        logger.error(f"[stream] Ошибка: {e}", exc_info=True)
+        yield ("done", "⚠️ Произошла ошибка при обработке запроса.", None)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ГЛАВНАЯ ФУНКЦИЯ
@@ -313,16 +568,14 @@ async def get_ai_response(
             full_prompt = user_text
 
         # ── 3. Запрос к Gemini ────────────────────────────────────────────────
-        today  = datetime.now().strftime("%d.%m.%Y")
-        model  = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
         if model in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash", "text-embedding-004"]:
             model = "gemini-2.5-flash"
-        system = _SYSTEM_INSTRUCTION.format(today=today)
 
         config = genai_types.GenerateContentConfig(
-            system_instruction=system,
+            system_instruction=_get_system_prompt(),
             temperature=0.1,
-            max_output_tokens=1200,
+            max_output_tokens=900,
             tools=[genai_types.Tool(google_search=genai_types.GoogleSearch())],
         )
 
@@ -352,7 +605,7 @@ async def get_ai_response(
                 logger.warning(f"[ai] Попытка {attempt+1} не удалась: {e}")
                 if attempt == 2:
                     raise e
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(0.5)
 
         # Извлекаем текст.
         # ВАЖНО: в google-genai SDK response.text может БРОСИТЬ исключение
@@ -393,16 +646,21 @@ async def get_ai_response(
         if not answer or not answer.strip():
             return "⚠️ Не удалось получить ответ. Пожалуйста, переформулируйте вопрос."
 
-        # ── 5. Сохраняем диалог в Firebase (для обучения на ошибках) ─────────
-        doc_id = await asyncio.to_thread(
-            save_dialog,
-            user_id or 0,
-            user_text,
-            answer,
-            thread_id,
-            query_embedding or None,
-        )
-        logger.info(f"[dialog] Сохранён: {doc_id}")
+        # ── 5. Сохраняем диалог в Firebase фоном (не блокируем ответ) ──────
+        doc_id = f"dlg_{hash(user_text + str(user_id)):x}"  # временный ID для кнопок
+
+        async def _save_bg():
+            real_id = await asyncio.to_thread(
+                save_dialog,
+                user_id or 0,
+                user_text,
+                answer,
+                thread_id,
+                query_embedding or None,
+            )
+            logger.info(f"[dialog] Сохранён фоном: {real_id}")
+
+        asyncio.create_task(_save_bg())
 
         return answer, doc_id
 

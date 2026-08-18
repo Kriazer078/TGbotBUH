@@ -44,6 +44,10 @@ GREETINGS = (
     "С понедельником! ☀️ Коротко и понятно рассказываем, что произошло за последние сутки.",
 )
 DIGEST_SECTION_SEPARATOR = "\n\n──────────\n\n"
+TELEGRAM_NEWS_CHANNELS = (
+    ("prg_jur", "ZANGER | PRG"),
+    ("commentariuskz", "Комментарий"),
+)
 
 
 def digest_schedule(env: dict[str, str] | None = None) -> dict:
@@ -103,6 +107,61 @@ def _canonical_url(value: str) -> str:
             "",
         )
     )
+
+
+def parse_telegram_feed(payload: str, channel: str, source: str) -> list[dict]:
+    """Parse stable, timestamped text posts from a public Telegram page."""
+    soup = BeautifulSoup(payload, "html.parser")
+    items = []
+    for message in soup.select(".tgme_widget_message[data-post]"):
+        data_post = str(message.get("data-post", "")).strip()
+        if not data_post.startswith(f"{channel}/"):
+            continue
+        message_id = data_post.split("/", 1)[1]
+        if not message_id.isdigit():
+            continue
+        time_node = message.select_one("time[datetime]")
+        text_node = message.select_one(".tgme_widget_message_text")
+        published = str(time_node.get("datetime", "")).strip() if time_node else ""
+        text = text_node.get_text(" ", strip=True) if text_node else ""
+        if not published or len(text) < 20:
+            continue
+        items.append(
+            {
+                "article_id": f"telegram:{data_post}",
+                "title": _clip_text(text, 180),
+                "text": text,
+                "url": f"https://t.me/{data_post}",
+                "source": source,
+                "date": published,
+                "is_world": False,
+            }
+        )
+    return items
+
+
+async def fetch_telegram_news(http_get=None) -> list[dict]:
+    """Fetch configured public channels without requiring Telegram credentials."""
+    getter = http_get or requests.get
+
+    async def fetch(channel: str, source: str) -> list[dict]:
+        try:
+            response = await asyncio.to_thread(
+                getter,
+                f"https://t.me/s/{channel}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            return parse_telegram_feed(response.text, channel, source)
+        except requests.RequestException as exc:
+            logger.warning("[weekly_digest] Telegram %s unavailable: %s", channel, exc)
+            return []
+
+    batches = await asyncio.gather(
+        *(fetch(channel, source) for channel, source in TELEGRAM_NEWS_CHANNELS)
+    )
+    return [item for batch in batches for item in batch]
 
 
 def _title_key(value: str) -> str:

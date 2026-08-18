@@ -9,12 +9,59 @@ from bot.services.news_digest_service import (
     digest_schedule,
     format_digest,
     normalize_candidates,
+    fetch_telegram_news,
+    parse_telegram_feed,
     parse_ranked_items,
     publish_digest,
     rank_and_summarize,
     search_additional_news,
     split_digest,
 )
+
+
+class TelegramFeedTests(unittest.IsolatedAsyncioTestCase):
+    HTML = """
+    <div class="tgme_widget_message" data-post="prg_jur/101">
+      <div class="tgme_widget_message_text">НБК изменил правила для банков<br>Изменения влияют на бизнес.</div>
+      <time datetime="2026-08-18T03:15:00+00:00"></time>
+    </div>
+    <div class="tgme_widget_message" data-post="prg_jur/102">
+      <div class="tgme_widget_message_text">Сообщение без времени</div>
+    </div>
+    """
+
+    def test_parses_exact_timestamp_text_and_canonical_post_url(self):
+        items = parse_telegram_feed(self.HTML, "prg_jur", "ZANGER | PRG")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["article_id"], "telegram:prg_jur/101")
+        self.assertEqual(items[0]["url"], "https://t.me/prg_jur/101")
+        self.assertEqual(items[0]["date"], "2026-08-18T03:15:00+00:00")
+        self.assertEqual(items[0]["source"], "ZANGER | PRG")
+        self.assertIn("Изменения влияют", items[0]["text"])
+
+    async def test_fetches_both_channels_independently(self):
+        requested = []
+
+        class Response:
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        def getter(url, **kwargs):
+            requested.append(url)
+            channel = url.rsplit("/", 1)[-1]
+            return Response(TelegramFeedTests.HTML.replace("prg_jur", channel))
+
+        items = await fetch_telegram_news(http_get=getter)
+
+        self.assertEqual(
+            requested,
+            ["https://t.me/s/prg_jur", "https://t.me/s/commentariuskz"],
+        )
+        self.assertEqual(len(items), 2)
 
 
 class NormalizeCandidatesTests(unittest.TestCase):

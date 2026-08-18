@@ -67,6 +67,26 @@ async def weekly_digest_endpoint(request, bot, now=None):
     return web.json_response({"ok": True})
 
 
+async def primary_documents_endpoint(request, bot):
+    """Accept only authenticated scheduler calls for the photo broadcast."""
+    expected_secret = os.getenv("INTERNAL_TICK_SECRET", "")
+    provided_secret = request.headers.get("X-Internal-Secret", "")
+    if not expected_secret or not provided_secret or not hmac.compare_digest(
+        provided_secret, expected_secret
+    ):
+        return web.json_response({"ok": False}, status=401)
+
+    from bot.services.primary_documents_broadcast import publish_primary_documents
+
+    try:
+        result = await publish_primary_documents(bot)
+    except Exception:
+        logger.exception("[primary_documents] Broadcast could not start")
+        return web.json_response({"ok": False}, status=500)
+
+    return web.json_response({"ok": True, **result})
+
+
 def create_app(bot: Bot, dispatcher: Dispatcher):
     """Build the aiohttp application and register external/internal routes."""
     app = web.Application()
@@ -77,7 +97,11 @@ def create_app(bot: Bot, dispatcher: Dispatcher):
     async def _weekly_digest_handler(request):
         return await weekly_digest_endpoint(request, bot)
 
+    async def _primary_documents_handler(request):
+        return await primary_documents_endpoint(request, bot)
+
     app.router.add_post("/internal/weekly-digest", _weekly_digest_handler)
+    app.router.add_post("/internal/primary-documents", _primary_documents_handler)
     setup_application(app, dispatcher, bot=bot)
     return app
 

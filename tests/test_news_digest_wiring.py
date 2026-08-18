@@ -6,8 +6,60 @@ from unittest.mock import AsyncMock, patch
 from aiogram import Dispatcher
 
 from bot.handlers.user_handlers import cmd_send_news
-from bot.main import create_app, register_weekly_digest_job, weekly_digest_endpoint
+from bot.main import (
+    create_app,
+    primary_documents_endpoint,
+    register_weekly_digest_job,
+    weekly_digest_endpoint,
+)
 from bot.services.news_digest_service import DigestItem, NewsCandidate, format_digest
+from bot.services.primary_documents_broadcast import (
+    parse_broadcast_targets,
+    publish_primary_documents,
+)
+
+
+class PrimaryDocumentsTargetTests(unittest.TestCase):
+    def test_parses_internal_chat_ids_with_general_topic(self):
+        targets = parse_broadcast_targets("3918833089/1 3031822455/1")
+
+        self.assertEqual(targets, [(-1003918833089, 1), (-1003031822455, 1)])
+
+    def test_rejects_duplicate_or_malformed_targets(self):
+        with self.assertRaises(ValueError):
+            parse_broadcast_targets("3918833089/1 3918833089/1")
+
+        with self.assertRaises(ValueError):
+            parse_broadcast_targets("3918833089/not-a-topic")
+
+
+class PrimaryDocumentsPublishingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sends_one_photo_to_each_allowlisted_general_topic(self):
+        bot = AsyncMock()
+        environment = {
+            "PRIMARY_DOCUMENT_TARGETS": "3918833089/1 3031822455/1",
+            "PRIMARY_DOCUMENT_IMAGE_PATH": "C:/safe/primary-documents.png",
+        }
+
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "bot.services.primary_documents_broadcast.FSInputFile",
+            side_effect=lambda path: f"file:{path}",
+        ):
+            result = await publish_primary_documents(bot)
+
+        self.assertEqual(result, {"sent": 2, "failed": 0})
+        bot.send_photo.assert_has_awaits([
+            unittest.mock.call(
+                chat_id=-1003918833089,
+                message_thread_id=1,
+                photo="file:C:/safe/primary-documents.png",
+            ),
+            unittest.mock.call(
+                chat_id=-1003031822455,
+                message_thread_id=1,
+                photo="file:C:/safe/primary-documents.png",
+            ),
+        ])
 
 
 class FakeScheduler:
@@ -90,6 +142,7 @@ class CloudSchedulerEndpointTests(unittest.IsolatedAsyncioTestCase):
 
         routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
         self.assertIn(("POST", "/internal/weekly-digest"), routes)
+        self.assertIn(("POST", "/internal/primary-documents"), routes)
 
     async def test_rejects_missing_request_secret(self):
         with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}), patch(
@@ -105,6 +158,28 @@ class CloudSchedulerEndpointTests(unittest.IsolatedAsyncioTestCase):
             "bot.services.news_digest_service.publish_digest", AsyncMock()
         ) as publish:
             response = await weekly_digest_endpoint(FakeRequest("incorrect"), object())
+
+        self.assertEqual(response.status, 401)
+        publish.assert_not_awaited()
+
+
+class PrimaryDocumentsEndpointTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authorized_request_starts_allowlisted_photo_delivery(self):
+        with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}, clear=True), patch(
+            "bot.services.primary_documents_broadcast.publish_primary_documents",
+            AsyncMock(return_value={"sent": 44, "failed": 0}),
+        ) as publish:
+            response = await primary_documents_endpoint(FakeRequest("expected"), object())
+
+        self.assertEqual(response.status, 200)
+        self.assertTrue(publish.awaited)
+
+    async def test_rejects_request_without_internal_secret(self):
+        with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}, clear=True), patch(
+            "bot.services.primary_documents_broadcast.publish_primary_documents",
+            AsyncMock(),
+        ) as publish:
+            response = await primary_documents_endpoint(FakeRequest(), object())
 
         self.assertEqual(response.status, 401)
         publish.assert_not_awaited()

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 _TARGET_PATTERN = re.compile(r"(?P<chat_id>\d{8,12})/(?P<thread_id>[1-9]\d*)$")
 
 
-def parse_broadcast_targets(raw_targets: str) -> list[tuple[int, int]]:
+def parse_broadcast_targets(raw_targets: str) -> list[tuple[int, int | None]]:
     """Convert the supplied ``internal_chat_id/topic_id`` list to Bot API IDs.
 
     Telegram private-supergroup links expose the internal id without the
@@ -24,7 +24,7 @@ def parse_broadcast_targets(raw_targets: str) -> list[tuple[int, int]]:
     if not tokens:
         raise ValueError("PRIMARY_DOCUMENT_TARGETS must not be empty")
 
-    targets: list[tuple[int, int]] = []
+    targets: list[tuple[int, int | None]] = []
     seen: set[int] = set()
     for token in tokens:
         match = _TARGET_PATTERN.fullmatch(token)
@@ -34,7 +34,10 @@ def parse_broadcast_targets(raw_targets: str) -> list[tuple[int, int]]:
         if internal_chat_id in seen:
             raise ValueError(f"Duplicate broadcast chat: {internal_chat_id}")
         seen.add(internal_chat_id)
-        targets.append((-1000000000000 - internal_chat_id, int(match.group("thread_id"))))
+        thread_id = int(match.group("thread_id"))
+        # /1 identifies the General section in a copied forum link. The Bot
+        # API addresses General by omitting message_thread_id.
+        targets.append((-1000000000000 - internal_chat_id, None if thread_id == 1 else thread_id))
 
     return targets
 

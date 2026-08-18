@@ -23,7 +23,7 @@ class PrimaryDocumentsTargetTests(unittest.TestCase):
     def test_parses_internal_chat_ids_with_general_topic(self):
         targets = parse_broadcast_targets("3918833089/1 3031822455/1")
 
-        self.assertEqual(targets, [(-1003918833089, 1), (-1003031822455, 1)])
+        self.assertEqual(targets, [(-1003918833089, None), (-1003031822455, None)])
 
     def test_rejects_duplicate_or_malformed_targets(self):
         with self.assertRaises(ValueError):
@@ -51,12 +51,12 @@ class PrimaryDocumentsPublishingTests(unittest.IsolatedAsyncioTestCase):
         bot.send_photo.assert_has_awaits([
             unittest.mock.call(
                 chat_id=-1003918833089,
-                message_thread_id=1,
+                message_thread_id=None,
                 photo="file:C:/safe/primary-documents.png",
             ),
             unittest.mock.call(
                 chat_id=-1003031822455,
-                message_thread_id=1,
+                message_thread_id=None,
                 photo="file:C:/safe/primary-documents.png",
             ),
         ])

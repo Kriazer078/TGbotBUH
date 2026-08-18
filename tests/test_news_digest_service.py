@@ -336,6 +336,8 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(candidate.url, models.contents)
         self.assertEqual(models.config["response_mime_type"], "application/json")
         self.assertEqual(models.config["response_schema"]["type"], "object")
+        self.assertGreaterEqual(models.config["max_output_tokens"], 8000)
+        self.assertEqual(models.config["thinking_config"]["thinking_budget"], 0)
         self.assertEqual(items[0].candidate.article_id, "1")
         self.assertIn("Финансовые условия", overview)
 

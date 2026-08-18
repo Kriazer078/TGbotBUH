@@ -370,7 +370,8 @@ async def rank_and_summarize(
                     contents=prompt,
                     config={
                         "temperature": 0.1,
-                        "max_output_tokens": 2400,
+                        "max_output_tokens": 8000,
+                        "thinking_config": {"thinking_budget": 0},
                         "response_mime_type": "application/json",
                         "response_schema": RANKING_RESPONSE_SCHEMA,
                     },

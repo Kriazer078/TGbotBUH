@@ -33,6 +33,11 @@ WEBHOOK_URL  = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT         = int(os.getenv("PORT", 8080))
 
 
+def _news_thread_id():
+    value = int(os.getenv("NEWS_TARGET_THREAD_ID", "0"))
+    return value if value > 0 else None
+
+
 async def weekly_digest_endpoint(request, bot, now=None):
     """Authenticate a Cloud Scheduler request before publishing a digest."""
     expected_secret = os.getenv("INTERNAL_TICK_SECRET", "")
@@ -51,7 +56,7 @@ async def weekly_digest_endpoint(request, bot, now=None):
         await publish_digest(
             bot,
             chat_id=int(os.getenv("NEWS_TARGET_CHAT_ID", "-1002318310296")),
-            thread_id=int(os.getenv("NEWS_TARGET_THREAD_ID", "1")),
+            thread_id=_news_thread_id(),
             publication_key=publication_key,
             test_mode=False,
         )
@@ -101,7 +106,7 @@ def register_weekly_digest_job(bot: Bot, target_scheduler=scheduler):
                 chat_id = int(
                     os.getenv("NEWS_TARGET_CHAT_ID", "-1002318310296")
                 )
-                thread_id = int(os.getenv("NEWS_TARGET_THREAD_ID", "1"))
+                thread_id = _news_thread_id()
 
             await publish_digest(
                 bot,

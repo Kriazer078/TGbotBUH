@@ -343,7 +343,11 @@ async def cmd_send_news(message: Message):
                 chat_id=int(
                     os.getenv("NEWS_TARGET_CHAT_ID", "-1002318310296")
                 ),
-                thread_id=int(os.getenv("NEWS_TARGET_THREAD_ID", "1")),
+                thread_id=(
+                    int(os.getenv("NEWS_TARGET_THREAD_ID", "0"))
+                    if int(os.getenv("NEWS_TARGET_THREAD_ID", "0")) > 0
+                    else None
+                ),
                 publication_key=datetime.now(
                     ZoneInfo(timezone_name)
                 ).date().isoformat(),

@@ -62,6 +62,20 @@ class CloudSchedulerEndpointTests(unittest.IsolatedAsyncioTestCase):
             test_mode=False,
         )
 
+    async def test_zero_thread_id_publishes_to_general_chat(self):
+        environment = {
+            "INTERNAL_TICK_SECRET": "expected",
+            "NEWS_TARGET_CHAT_ID": "-1002318310296",
+            "NEWS_TARGET_THREAD_ID": "0",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "bot.services.news_digest_service.publish_digest", AsyncMock(return_value=True)
+        ) as publish:
+            response = await weekly_digest_endpoint(FakeRequest("expected"), object())
+
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(publish.await_args.kwargs["thread_id"])
+
     async def test_publication_failure_returns_500(self):
         with patch.dict(os.environ, {"INTERNAL_TICK_SECRET": "expected"}), patch(
             "bot.services.news_digest_service.publish_digest",

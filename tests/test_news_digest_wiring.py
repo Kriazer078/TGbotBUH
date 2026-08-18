@@ -184,6 +184,23 @@ class PrimaryDocumentsEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 401)
         publish.assert_not_awaited()
 
+    async def test_test_endpoint_uses_only_separate_test_chat(self):
+        environment = {
+            "INTERNAL_TICK_SECRET": "expected",
+            "PRIMARY_DOCUMENT_TEST_TARGET": "2318310296/1",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "bot.services.primary_documents_broadcast.publish_primary_documents",
+            AsyncMock(return_value={"sent": 1, "failed": 0}),
+        ) as publish:
+            from bot.main import primary_documents_test_endpoint
+
+            bot = object()
+            response = await primary_documents_test_endpoint(FakeRequest("expected"), bot)
+
+        self.assertEqual(response.status, 200)
+        publish.assert_awaited_once_with(bot, raw_targets="2318310296/1")
+
 
 class SchedulerWiringTests(unittest.IsolatedAsyncioTestCase):
     def test_registers_monday_job_at_0930_almaty(self):

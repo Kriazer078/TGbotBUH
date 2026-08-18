@@ -87,6 +87,30 @@ async def primary_documents_endpoint(request, bot):
     return web.json_response({"ok": True, **result})
 
 
+async def primary_documents_test_endpoint(request, bot):
+    """Deliver the image to one separately configured test chat only."""
+    expected_secret = os.getenv("INTERNAL_TICK_SECRET", "")
+    provided_secret = request.headers.get("X-Internal-Secret", "")
+    if not expected_secret or not provided_secret or not hmac.compare_digest(
+        provided_secret, expected_secret
+    ):
+        return web.json_response({"ok": False}, status=401)
+
+    test_target = os.getenv("PRIMARY_DOCUMENT_TEST_TARGET", "")
+    if not test_target:
+        return web.json_response({"ok": False}, status=400)
+
+    from bot.services.primary_documents_broadcast import publish_primary_documents
+
+    try:
+        result = await publish_primary_documents(bot, raw_targets=test_target)
+    except Exception:
+        logger.exception("[primary_documents] Test delivery could not start")
+        return web.json_response({"ok": False}, status=500)
+
+    return web.json_response({"ok": True, **result})
+
+
 def create_app(bot: Bot, dispatcher: Dispatcher):
     """Build the aiohttp application and register external/internal routes."""
     app = web.Application()
@@ -100,8 +124,12 @@ def create_app(bot: Bot, dispatcher: Dispatcher):
     async def _primary_documents_handler(request):
         return await primary_documents_endpoint(request, bot)
 
+    async def _primary_documents_test_handler(request):
+        return await primary_documents_test_endpoint(request, bot)
+
     app.router.add_post("/internal/weekly-digest", _weekly_digest_handler)
     app.router.add_post("/internal/primary-documents", _primary_documents_handler)
+    app.router.add_post("/internal/primary-documents-test", _primary_documents_test_handler)
     setup_application(app, dispatcher, bot=bot)
     return app
 

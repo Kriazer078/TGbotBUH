@@ -39,14 +39,18 @@ def parse_broadcast_targets(raw_targets: str) -> list[tuple[int, int]]:
     return targets
 
 
-async def publish_primary_documents(bot) -> dict[str, int]:
+async def publish_primary_documents(
+    bot, raw_targets: str | None = None
+) -> dict[str, int]:
     """Send exactly one configured image to every configured General topic.
 
     Each target is independent: a single inaccessible chat is logged but
     cannot block the remaining client chats or cause a global retry that
     duplicates already delivered images.
     """
-    targets = parse_broadcast_targets(os.getenv("PRIMARY_DOCUMENT_TARGETS", ""))
+    targets = parse_broadcast_targets(
+        raw_targets if raw_targets is not None else os.getenv("PRIMARY_DOCUMENT_TARGETS", "")
+    )
     image_path = os.getenv("PRIMARY_DOCUMENT_IMAGE_PATH", "/app/bot/assets/primary-documents.png")
     sent = 0
     failed = 0

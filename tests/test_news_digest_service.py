@@ -9,12 +9,68 @@ from bot.services.news_digest_service import (
     digest_schedule,
     format_digest,
     normalize_candidates,
+    fetch_telegram_news,
+    parse_telegram_feed,
     parse_ranked_items,
     publish_digest,
     rank_and_summarize,
     search_additional_news,
     split_digest,
 )
+
+
+class TelegramFeedTests(unittest.IsolatedAsyncioTestCase):
+    HTML = """
+    <div class="tgme_widget_message" data-post="prg_jur/101">
+      <div class="tgme_widget_message_text">НБК изменил правила для банков<br>Изменения влияют на бизнес.</div>
+      <time datetime="2026-08-18T03:15:00+00:00"></time>
+    </div>
+    <div class="tgme_widget_message" data-post="prg_jur/102">
+      <div class="tgme_widget_message_text">Сообщение без времени</div>
+    </div>
+    """
+
+    def test_parses_exact_timestamp_text_and_canonical_post_url(self):
+        items = parse_telegram_feed(self.HTML, "prg_jur", "ZANGER | PRG")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["article_id"], "telegram:prg_jur/101")
+        self.assertEqual(items[0]["url"], "https://t.me/prg_jur/101")
+        self.assertEqual(items[0]["date"], "2026-08-18T03:15:00+00:00")
+        self.assertEqual(items[0]["source"], "ZANGER | PRG")
+        self.assertIn("Изменения влияют", items[0]["text"])
+
+    def test_marks_non_kazakhstan_commentary_post_as_world(self):
+        payload = self.HTML.replace("prg_jur", "commentariuskz").replace(
+            "НБК изменил правила для банков", "ФРС США сохранила процентную ставку"
+        ).replace("Изменения влияют на бизнес.", "Решение влияет на мировые рынки.")
+
+        items = parse_telegram_feed(payload, "commentariuskz", "Комментарий")
+
+        self.assertTrue(items[0]["is_world"])
+
+    async def test_fetches_both_channels_independently(self):
+        requested = []
+
+        class Response:
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        def getter(url, **kwargs):
+            requested.append(url)
+            channel = url.rsplit("/", 1)[-1]
+            return Response(TelegramFeedTests.HTML.replace("prg_jur", channel))
+
+        items = await fetch_telegram_news(http_get=getter)
+
+        self.assertEqual(
+            requested,
+            ["https://t.me/s/prg_jur", "https://t.me/s/commentariuskz"],
+        )
+        self.assertEqual(len(items), 2)
 
 
 class NormalizeCandidatesTests(unittest.TestCase):
@@ -200,6 +256,18 @@ class DigestFormattingTests(unittest.TestCase):
         )
         self.assertEqual(overview, "Главный вывод дня.")
 
+    def test_parser_accepts_raw_control_characters_in_json_strings(self):
+        payload = (
+            '{"items":[{"url":"https://example.com/1",'
+            '"summary":"Первая строка\nВторая строка",'
+            '"importance":"Важно."}],"overview":"Вывод."}'
+        )
+
+        items, overview = parse_ranked_items(payload, self.candidates)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(overview, "Вывод.")
+
     def test_format_contains_context_importance_source_and_time(self):
         item = DigestItem(
             self.candidates[0],
@@ -235,9 +303,11 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
         class FakeModels:
             def __init__(self):
                 self.contents = ""
+                self.config = {}
 
             async def generate_content(self, **kwargs):
                 self.contents = kwargs["contents"]
+                self.config = kwargs["config"]
                 return type(
                     "Response",
                     (),
@@ -264,6 +334,8 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
         items, overview = await rank_and_summarize([candidate], client=fake_client)
 
         self.assertIn(candidate.url, models.contents)
+        self.assertEqual(models.config["response_mime_type"], "application/json")
+        self.assertEqual(models.config["response_schema"]["type"], "object")
         self.assertEqual(items[0].candidate.article_id, "1")
         self.assertIn("Финансовые условия", overview)
 
@@ -360,6 +432,55 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_prioritizes_five_fresh_telegram_candidates(self):
+        now = datetime(2026, 8, 18, 5, 0, tzinfo=timezone.utc)
+        titles = [
+            "НБК изменил банковские правила",
+            "Экспорт Казахстана вырос",
+            "Цены на жильё изменились",
+            "Предпринимателям дали льготы",
+            "ФРС США сохранила ставку",
+        ]
+        telegram = [
+            {
+                "article_id": f"telegram:{index}",
+                "title": titles[index - 1],
+                "text": "Важные подробности экономики и бизнеса",
+                "url": f"https://t.me/commentariuskz/{index}",
+                "source": "Комментарий",
+                "date": "2026-08-18T04:00:00Z",
+                "is_world": index == 5,
+            }
+            for index in range(1, 6)
+        ]
+        fallback_calls = []
+        seen = []
+
+        async def empty_primary():
+            return []
+
+        async def telegram_fetcher():
+            return telegram
+
+        async def fallback_search(_now):
+            fallback_calls.append(True)
+            return []
+
+        async def ranker(candidates):
+            seen.extend(candidates)
+            return [DigestItem(candidates[0], "Сводка.", "Важно.")], "Вывод."
+
+        await build_digest(
+            now=now,
+            fetcher=empty_primary,
+            telegram_fetcher=telegram_fetcher,
+            fallback_search=fallback_search,
+            ranker=ranker,
+        )
+
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(fallback_calls, [])
+
     async def test_build_uses_fallback_when_primary_has_fewer_than_five(self):
         now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
         primary = [
@@ -398,6 +519,7 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         text, article_ids = await build_digest(
             now=now,
             fetcher=fetcher,
+            telegram_fetcher=self._empty_telegram,
             fallback_search=fallback_search,
             ranker=ranker,
         )
@@ -452,11 +574,16 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         await build_digest(
             now=now,
             fetcher=fetcher,
+            telegram_fetcher=self._empty_telegram,
             fallback_search=fallback_search,
             ranker=ranker,
         )
 
         self.assertEqual(fallback_calls, [True])
+
+    @staticmethod
+    async def _empty_telegram():
+        return []
 
     async def test_publish_sends_to_topic_and_records_success(self):
         sent_messages = []

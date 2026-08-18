@@ -44,6 +44,30 @@ GREETINGS = (
     "С понедельником! ☀️ Коротко и понятно рассказываем, что произошло за последние сутки.",
 )
 DIGEST_SECTION_SEPARATOR = "\n\n──────────\n\n"
+TELEGRAM_NEWS_CHANNELS = (
+    ("prg_jur", "ZANGER | PRG"),
+    ("commentariuskz", "Комментарий"),
+)
+RANKING_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "importance": {"type": "string"},
+                },
+                "required": ["url", "summary", "importance"],
+            },
+        },
+        "overview": {"type": "string"},
+    },
+    "required": ["items", "overview"],
+}
 
 
 def digest_schedule(env: dict[str, str] | None = None) -> dict:
@@ -103,6 +127,69 @@ def _canonical_url(value: str) -> str:
             "",
         )
     )
+
+
+def parse_telegram_feed(payload: str, channel: str, source: str) -> list[dict]:
+    """Parse stable, timestamped text posts from a public Telegram page."""
+    soup = BeautifulSoup(payload, "html.parser")
+    items = []
+    for message in soup.select(".tgme_widget_message[data-post]"):
+        data_post = str(message.get("data-post", "")).strip()
+        if not data_post.startswith(f"{channel}/"):
+            continue
+        message_id = data_post.split("/", 1)[1]
+        if not message_id.isdigit():
+            continue
+        time_node = message.select_one("time[datetime]")
+        text_node = message.select_one(".tgme_widget_message_text")
+        published = str(time_node.get("datetime", "")).strip() if time_node else ""
+        text = text_node.get_text(" ", strip=True) if text_node else ""
+        if not published or len(text) < 20:
+            continue
+        kazakhstan_signals = (
+            "казахстан", "казах", "тенге", "нбк", "нацбанк", "kase",
+            "алматы", "астана", " рк ",
+        )
+        searchable = f" {text.lower()} "
+        is_world = channel == "commentariuskz" and not any(
+            signal in searchable for signal in kazakhstan_signals
+        )
+        items.append(
+            {
+                "article_id": f"telegram:{data_post}",
+                "title": _clip_text(text, 180),
+                "text": text,
+                "url": f"https://t.me/{data_post}",
+                "source": source,
+                "date": published,
+                "is_world": is_world,
+            }
+        )
+    return items
+
+
+async def fetch_telegram_news(http_get=None) -> list[dict]:
+    """Fetch configured public channels without requiring Telegram credentials."""
+    getter = http_get or requests.get
+
+    async def fetch(channel: str, source: str) -> list[dict]:
+        try:
+            response = await asyncio.to_thread(
+                getter,
+                f"https://t.me/s/{channel}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+            response.raise_for_status()
+            return parse_telegram_feed(response.text, channel, source)
+        except requests.RequestException as exc:
+            logger.warning("[weekly_digest] Telegram %s unavailable: %s", channel, exc)
+            return []
+
+    batches = await asyncio.gather(
+        *(fetch(channel, source) for channel, source in TELEGRAM_NEWS_CHANNELS)
+    )
+    return [item for batch in batches for item in batch]
 
 
 def _title_key(value: str) -> str:
@@ -175,7 +262,7 @@ def parse_ranked_items(
     payload: str,
     candidates: list[NewsCandidate],
 ) -> tuple[list[DigestItem], str]:
-    data = json.loads(_clean_json_payload(payload))
+    data = json.loads(_clean_json_payload(payload), strict=False)
     if not isinstance(data, dict):
         raise ValueError("Gemini response must be a JSON object")
     by_url = {item.url: item for item in candidates}
@@ -266,6 +353,8 @@ async def rank_and_summarize(
     prompt = (
         "Выбери до 5 важнейших новостей экономики и бизнеса. "
         "Казахстан имеет приоритет; мировых новостей максимум две. "
+        "Игнорируй рекламу, развлечения и общую политику. Юридические новости "
+        "выбирай только если они практически влияют на бизнес. "
         "Используй только переданные URL. Для каждой дай summary из 2–3 "
         "коротких предложений и importance — одно практическое предложение. "
         'Верни только JSON: {"items":[{"url":"...","summary":"...",'
@@ -279,7 +368,12 @@ async def rank_and_summarize(
                 gemini_client.aio.models.generate_content(
                     model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                     contents=prompt,
-                    config={"temperature": 0.1, "max_output_tokens": 1800},
+                    config={
+                        "temperature": 0.1,
+                        "max_output_tokens": 2400,
+                        "response_mime_type": "application/json",
+                        "response_schema": RANKING_RESPONSE_SCHEMA,
+                    },
                 ),
                 timeout=float(os.getenv("NEWS_AI_TIMEOUT_SECONDS", "30")),
             )
@@ -405,7 +499,9 @@ async def search_additional_news(
                 ),
                 timeout=float(os.getenv("NEWS_AI_TIMEOUT_SECONDS", "30")),
             )
-            raw_items = json.loads(_clean_json_payload(response.text or "[]"))
+            raw_items = json.loads(
+                _clean_json_payload(response.text or "[]"), strict=False
+            )
             if not isinstance(raw_items, list) or any(
                 not isinstance(item, dict) for item in raw_items
             ):
@@ -487,6 +583,7 @@ def split_digest(text: str, limit: int = 3900) -> list[str]:
 async def build_digest(
     now: datetime | None = None,
     fetcher=None,
+    telegram_fetcher=None,
     fallback_search=None,
     ranker=None,
 ) -> tuple[str, list[str]]:
@@ -494,15 +591,16 @@ async def build_digest(
         from bot.rag.news_parser import fetch_all_news
 
         fetcher = fetch_all_news
+    telegram = telegram_fetcher or fetch_telegram_news
     fallback = fallback_search or search_additional_news
     select = ranker or rank_and_summarize
     current = now or datetime.now(timezone.utc)
 
-    primary = await fetcher()
-    candidates = normalize_candidates(primary, current)
-    if len(candidates) < 10 or not any(item.is_world for item in candidates):
+    primary, telegram_items = await asyncio.gather(fetcher(), telegram())
+    candidates = normalize_candidates(telegram_items + primary, current)
+    if len(candidates) < 5 or not any(item.is_world for item in candidates):
         additional = await fallback(current)
-        candidates = normalize_candidates(primary + additional, current)
+        candidates = normalize_candidates(telegram_items + primary + additional, current)
     if not candidates:
         raise RuntimeError("Не найдено проверенных новостей за последние 24 часа")
 

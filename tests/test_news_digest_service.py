@@ -256,6 +256,18 @@ class DigestFormattingTests(unittest.TestCase):
         )
         self.assertEqual(overview, "Главный вывод дня.")
 
+    def test_parser_accepts_raw_control_characters_in_json_strings(self):
+        payload = (
+            '{"items":[{"url":"https://example.com/1",'
+            '"summary":"Первая строка\nВторая строка",'
+            '"importance":"Важно."}],"overview":"Вывод."}'
+        )
+
+        items, overview = parse_ranked_items(payload, self.candidates)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(overview, "Вывод.")
+
     def test_format_contains_context_importance_source_and_time(self):
         item = DigestItem(
             self.candidates[0],
@@ -291,9 +303,11 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
         class FakeModels:
             def __init__(self):
                 self.contents = ""
+                self.config = {}
 
             async def generate_content(self, **kwargs):
                 self.contents = kwargs["contents"]
+                self.config = kwargs["config"]
                 return type(
                     "Response",
                     (),
@@ -320,6 +334,8 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
         items, overview = await rank_and_summarize([candidate], client=fake_client)
 
         self.assertIn(candidate.url, models.contents)
+        self.assertEqual(models.config["response_mime_type"], "application/json")
+        self.assertEqual(models.config["response_schema"]["type"], "object")
         self.assertEqual(items[0].candidate.article_id, "1")
         self.assertIn("Финансовые условия", overview)
 

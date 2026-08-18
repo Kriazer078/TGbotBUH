@@ -48,6 +48,26 @@ TELEGRAM_NEWS_CHANNELS = (
     ("prg_jur", "ZANGER | PRG"),
     ("commentariuskz", "Комментарий"),
 )
+RANKING_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "maxItems": 5,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "importance": {"type": "string"},
+                },
+                "required": ["url", "summary", "importance"],
+            },
+        },
+        "overview": {"type": "string"},
+    },
+    "required": ["items", "overview"],
+}
 
 
 def digest_schedule(env: dict[str, str] | None = None) -> dict:
@@ -242,7 +262,7 @@ def parse_ranked_items(
     payload: str,
     candidates: list[NewsCandidate],
 ) -> tuple[list[DigestItem], str]:
-    data = json.loads(_clean_json_payload(payload))
+    data = json.loads(_clean_json_payload(payload), strict=False)
     if not isinstance(data, dict):
         raise ValueError("Gemini response must be a JSON object")
     by_url = {item.url: item for item in candidates}
@@ -333,6 +353,8 @@ async def rank_and_summarize(
     prompt = (
         "Выбери до 5 важнейших новостей экономики и бизнеса. "
         "Казахстан имеет приоритет; мировых новостей максимум две. "
+        "Игнорируй рекламу, развлечения и общую политику. Юридические новости "
+        "выбирай только если они практически влияют на бизнес. "
         "Используй только переданные URL. Для каждой дай summary из 2–3 "
         "коротких предложений и importance — одно практическое предложение. "
         'Верни только JSON: {"items":[{"url":"...","summary":"...",'
@@ -346,7 +368,12 @@ async def rank_and_summarize(
                 gemini_client.aio.models.generate_content(
                     model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
                     contents=prompt,
-                    config={"temperature": 0.1, "max_output_tokens": 1800},
+                    config={
+                        "temperature": 0.1,
+                        "max_output_tokens": 2400,
+                        "response_mime_type": "application/json",
+                        "response_schema": RANKING_RESPONSE_SCHEMA,
+                    },
                 ),
                 timeout=float(os.getenv("NEWS_AI_TIMEOUT_SECONDS", "30")),
             )
@@ -472,7 +499,9 @@ async def search_additional_news(
                 ),
                 timeout=float(os.getenv("NEWS_AI_TIMEOUT_SECONDS", "30")),
             )
-            raw_items = json.loads(_clean_json_payload(response.text or "[]"))
+            raw_items = json.loads(
+                _clean_json_payload(response.text or "[]"), strict=False
+            )
             if not isinstance(raw_items, list) or any(
                 not isinstance(item, dict) for item in raw_items
             ):

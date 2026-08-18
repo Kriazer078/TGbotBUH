@@ -40,6 +40,15 @@ class TelegramFeedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0]["source"], "ZANGER | PRG")
         self.assertIn("Изменения влияют", items[0]["text"])
 
+    def test_marks_non_kazakhstan_commentary_post_as_world(self):
+        payload = self.HTML.replace("prg_jur", "commentariuskz").replace(
+            "НБК изменил правила для банков", "ФРС США сохранила процентную ставку"
+        ).replace("Изменения влияют на бизнес.", "Решение влияет на мировые рынки.")
+
+        items = parse_telegram_feed(payload, "commentariuskz", "Комментарий")
+
+        self.assertTrue(items[0]["is_world"])
+
     async def test_fetches_both_channels_independently(self):
         requested = []
 
@@ -407,6 +416,55 @@ class RankAndSummarizeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_prioritizes_five_fresh_telegram_candidates(self):
+        now = datetime(2026, 8, 18, 5, 0, tzinfo=timezone.utc)
+        titles = [
+            "НБК изменил банковские правила",
+            "Экспорт Казахстана вырос",
+            "Цены на жильё изменились",
+            "Предпринимателям дали льготы",
+            "ФРС США сохранила ставку",
+        ]
+        telegram = [
+            {
+                "article_id": f"telegram:{index}",
+                "title": titles[index - 1],
+                "text": "Важные подробности экономики и бизнеса",
+                "url": f"https://t.me/commentariuskz/{index}",
+                "source": "Комментарий",
+                "date": "2026-08-18T04:00:00Z",
+                "is_world": index == 5,
+            }
+            for index in range(1, 6)
+        ]
+        fallback_calls = []
+        seen = []
+
+        async def empty_primary():
+            return []
+
+        async def telegram_fetcher():
+            return telegram
+
+        async def fallback_search(_now):
+            fallback_calls.append(True)
+            return []
+
+        async def ranker(candidates):
+            seen.extend(candidates)
+            return [DigestItem(candidates[0], "Сводка.", "Важно.")], "Вывод."
+
+        await build_digest(
+            now=now,
+            fetcher=empty_primary,
+            telegram_fetcher=telegram_fetcher,
+            fallback_search=fallback_search,
+            ranker=ranker,
+        )
+
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(fallback_calls, [])
+
     async def test_build_uses_fallback_when_primary_has_fewer_than_five(self):
         now = datetime(2026, 8, 17, 3, 30, tzinfo=timezone.utc)
         primary = [
@@ -445,6 +503,7 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         text, article_ids = await build_digest(
             now=now,
             fetcher=fetcher,
+            telegram_fetcher=self._empty_telegram,
             fallback_search=fallback_search,
             ranker=ranker,
         )
@@ -499,11 +558,16 @@ class DigestOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         await build_digest(
             now=now,
             fetcher=fetcher,
+            telegram_fetcher=self._empty_telegram,
             fallback_search=fallback_search,
             ranker=ranker,
         )
 
         self.assertEqual(fallback_calls, [True])
+
+    @staticmethod
+    async def _empty_telegram():
+        return []
 
     async def test_publish_sends_to_topic_and_records_success(self):
         sent_messages = []

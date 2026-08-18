@@ -126,6 +126,14 @@ def parse_telegram_feed(payload: str, channel: str, source: str) -> list[dict]:
         text = text_node.get_text(" ", strip=True) if text_node else ""
         if not published or len(text) < 20:
             continue
+        kazakhstan_signals = (
+            "казахстан", "казах", "тенге", "нбк", "нацбанк", "kase",
+            "алматы", "астана", " рк ",
+        )
+        searchable = f" {text.lower()} "
+        is_world = channel == "commentariuskz" and not any(
+            signal in searchable for signal in kazakhstan_signals
+        )
         items.append(
             {
                 "article_id": f"telegram:{data_post}",
@@ -134,7 +142,7 @@ def parse_telegram_feed(payload: str, channel: str, source: str) -> list[dict]:
                 "url": f"https://t.me/{data_post}",
                 "source": source,
                 "date": published,
-                "is_world": False,
+                "is_world": is_world,
             }
         )
     return items
@@ -546,6 +554,7 @@ def split_digest(text: str, limit: int = 3900) -> list[str]:
 async def build_digest(
     now: datetime | None = None,
     fetcher=None,
+    telegram_fetcher=None,
     fallback_search=None,
     ranker=None,
 ) -> tuple[str, list[str]]:
@@ -553,15 +562,16 @@ async def build_digest(
         from bot.rag.news_parser import fetch_all_news
 
         fetcher = fetch_all_news
+    telegram = telegram_fetcher or fetch_telegram_news
     fallback = fallback_search or search_additional_news
     select = ranker or rank_and_summarize
     current = now or datetime.now(timezone.utc)
 
-    primary = await fetcher()
-    candidates = normalize_candidates(primary, current)
-    if len(candidates) < 10 or not any(item.is_world for item in candidates):
+    primary, telegram_items = await asyncio.gather(fetcher(), telegram())
+    candidates = normalize_candidates(telegram_items + primary, current)
+    if len(candidates) < 5 or not any(item.is_world for item in candidates):
         additional = await fallback(current)
-        candidates = normalize_candidates(primary + additional, current)
+        candidates = normalize_candidates(telegram_items + primary + additional, current)
     if not candidates:
         raise RuntimeError("Не найдено проверенных новостей за последние 24 часа")
 
